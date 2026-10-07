@@ -27,14 +27,72 @@ pub const BASE_BOTTOM_CORNER_RADIUS: f32 = BASE_COLLAPSED_BOTTOM_CORNER_RADIUS;
 pub const BASE_TOP_TRANSITION_RADIUS: f32 = BASE_COLLAPSED_TOP_TRANSITION_RADIUS;
 pub const BASE_TOP_TRANSITION_HEIGHT: f32 = BASE_COLLAPSED_TOP_TRANSITION_HEIGHT;
 
-// Expanded reference dimensions (600 × 120 logical DIP horizontal pill, compact smooth shoulder, subtle dropshadow)
+// Expanded reference dimensions (600 × 128 logical DIP window: 110 DIP notch + shadow margin horizontal pill, compact smooth shoulder, subtle dropshadow)
 pub const BASE_EXPANDED_WIDTH: f32 = 600.0;
-pub const BASE_EXPANDED_HEIGHT: f32 = 120.0;
-pub const BASE_EXPANDED_BOTTOM_CORNER_RADIUS: f32 = 28.0;
+pub const BASE_EXPANDED_HEIGHT: f32 = 128.0;
+pub const BASE_EXPANDED_BOTTOM_CORNER_RADIUS: f32 = 18.0;
+
+/// Expanded bottom corners use a continuous-curvature ("squircle") profile: the
+/// curve starts this much earlier along the wall/bottom edge (fraction of the
+/// radius) and eases in, instead of a circular arc meeting a straight edge.
+pub const EXPANDED_CORNER_SPAN_EXTRA: f32 = 0.30;
+/// Cubic handle length (fraction of the corner span): circle vs. smoothed corner.
+pub const CORNER_HANDLE_CIRCLE: f32 = 0.552_284_8;
+pub const CORNER_HANDLE_SMOOTH: f32 = 0.67;
+
+/// One bottom corner as a cubic Bezier in corner-local coordinates: starts on the
+/// side wall at (0, 0), ends on the bottom edge at (span, span). `handle` is the
+/// control-handle length as a fraction of `span` (0.5523 = circular arc).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CornerProfile {
+    pub span: f32,
+    pub handle: f32,
+}
+
+impl CornerProfile {
+    /// `smoothing` 0 = exact circular corner of `radius`; 1 = full continuous corner.
+    pub fn new(radius: f32, smoothing: f32, max_span: f32) -> Self {
+        let s = smoothing.clamp(0.0, 1.0);
+        Self {
+            span: (radius * (1.0 + EXPANDED_CORNER_SPAN_EXTRA * s))
+                .min(max_span)
+                .max(0.0),
+            handle: CORNER_HANDLE_CIRCLE + (CORNER_HANDLE_SMOOTH - CORNER_HANDLE_CIRCLE) * s,
+        }
+    }
+
+    /// Point on the corner curve at parameter t (corner-local coordinates).
+    pub fn point(&self, t: f32) -> (f32, f32) {
+        let (s, k) = (self.span, self.handle);
+        let mt = 1.0 - t;
+        let x = 3.0 * mt * t * t * (s - k * s) + t * t * t * s;
+        let y = 3.0 * mt * mt * t * (k * s) + 3.0 * mt * t * t * s + t * t * t * s;
+        (x, y)
+    }
+
+    /// Horizontal inset of the curve from the side wall at depth `v` below the
+    /// corner start (the curve's y is monotonic in t, so bisection is exact enough).
+    pub fn inset_at(&self, v: f32) -> f32 {
+        if self.span <= 0.0 {
+            return 0.0;
+        }
+        let v = v.clamp(0.0, self.span);
+        let (mut lo, mut hi) = (0.0f32, 1.0f32);
+        for _ in 0..24 {
+            let mid = 0.5 * (lo + hi);
+            if self.point(mid).1 < v {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        self.point(0.5 * (lo + hi)).0
+    }
+}
 pub const BASE_EXPANDED_TOP_TRANSITION_RADIUS: f32 = 14.0;
 pub const BASE_EXPANDED_TOP_TRANSITION_HEIGHT: f32 = 14.0;
 pub const BASE_EXPANDED_SHADOW_MARGIN_X: f32 = 10.0;
-pub const BASE_EXPANDED_SHADOW_MARGIN_BOTTOM: f32 = 10.0;
+pub const BASE_EXPANDED_SHADOW_MARGIN_BOTTOM: f32 = 18.0;
 pub const BASE_EXPANDED_SHADOW_OPACITY: f32 = 0.28;
 
 // Stroke & separation tokens
@@ -53,6 +111,7 @@ pub const BASE_SPACING: f32 = 8.0;
 // Typography tokens (logical point / DIP sizes)
 pub const FONT_FAMILY_PRIMARY: PCWSTR = w!("Segoe UI Variable Text");
 pub const FONT_FAMILY_FALLBACK: PCWSTR = w!("Segoe UI");
+pub const FONT_FAMILY_DISPLAY: PCWSTR = w!("Segoe UI Variable Display");
 pub const BASE_FONT_SIZE_PRIMARY: f32 = 13.0;
 pub const BASE_FONT_SIZE_SECONDARY: f32 = 10.5;
 pub const BASE_FONT_SIZE_MUTED: f32 = 9.0;
@@ -66,6 +125,87 @@ pub const BASE_EXPANDED_CLOCK_OPTICAL_Y_OFFSET: f32 = 0.0;
 pub const BASE_CLOCK_OPTICAL_Y_OFFSET: f32 = 0.0;
 pub const BASE_TITLE_OPTICAL_Y_OFFSET: f32 = 0.65;
 pub const BASE_HEADER_HEIGHT: f32 = 24.0;
+
+// Expanded media composition (DIP at 96 DPI). The text/controls stack equals the
+// expanded content height at 96 DPI: 20 + 16 + 14 + 22 = 72 (the 5 DIP control
+// spacing appears once a secondary line is hidden), and the artwork
+// is a square of the same height.
+pub const BASE_MEDIA_ARTWORK_SIZE: f32 = 72.0;
+/// Cover inset from the notch's side wall and bottom edge (nested in the
+/// bottom-left corner).
+pub const BASE_MEDIA_ARTWORK_INSET: f32 = 9.0;
+/// Added to the concentric artwork corner radius (notch radius minus inset).
+pub const BASE_MEDIA_ARTWORK_RADIUS_EXTRA: f32 = 3.0;
+/// Source-app badge (Spotify / Apple Music / YouTube Music) on the artwork corner.
+pub const BASE_MEDIA_BADGE_SIZE: f32 = 13.0;
+/// Badge corner radius as a fraction of its size (0.5 = circle).
+pub const BADGE_CORNER_FRACTION: f32 = 0.5;
+/// The badge straddles the artwork's bottom-right corner: it extends this far past
+/// the art's right and bottom edges...
+pub const BASE_MEDIA_BADGE_OVERHANG: f32 = 3.0;
+/// ...and is cut out of the cover by a ring of the notch's own black.
+pub const BASE_MEDIA_BADGE_RING: f32 = 2.0;
+pub const BASE_MEDIA_ARTWORK_GAP: f32 = 14.0;
+pub const BASE_MEDIA_TITLE_FONT_SIZE: f32 = 15.0;
+pub const BASE_MEDIA_ARTIST_FONT_SIZE: f32 = 12.0;
+pub const BASE_MEDIA_SOURCE_FONT_SIZE: f32 = 10.5;
+pub const BASE_MEDIA_TITLE_HEIGHT: f32 = 20.0;
+pub const BASE_MEDIA_ARTIST_HEIGHT: f32 = 16.0;
+pub const BASE_MEDIA_SOURCE_HEIGHT: f32 = 14.0;
+pub const BASE_MEDIA_CONTROLS_SPACING: f32 = 5.0;
+/// Visual diameter of a control's hover/press backdrop.
+pub const BASE_MEDIA_CONTROL_VISUAL_SIZE: f32 = 22.0;
+/// Hit area; extends below the visual row into the notch's bottom padding.
+pub const BASE_MEDIA_CONTROL_WIDTH: f32 = 32.0;
+pub const BASE_MEDIA_CONTROL_HEIGHT: f32 = 28.0;
+pub const BASE_MEDIA_CONTROL_GAP: f32 = 6.0;
+pub const BASE_MEDIA_ICON_SIZE: f32 = 12.0;
+pub const BASE_MEDIA_PLAY_ICON_SIZE: f32 = 13.0;
+/// Skip glyph: each of its two triangles is this fraction of the icon size wide.
+pub const SKIP_GLYPH_HALF_WIDTH: f32 = 0.56;
+/// Icon opacity at rest (full on hover): quiet until the pointer arrives.
+pub const MEDIA_ICON_REST_OPACITY: f32 = 0.82;
+pub const BASE_MEDIA_CLOCK_COLUMN_WIDTH: f32 = 112.0;
+pub const BASE_MEDIA_COLUMN_GAP: f32 = 16.0;
+pub const BASE_MEDIA_TIME_FONT_SIZE: f32 = 13.0;
+pub const BASE_MEDIA_DATE_FONT_SIZE: f32 = 11.0;
+
+/// Control feedback timings (control-local micro-interaction only).
+pub const MEDIA_HOVER_FADE_MS: f32 = 110.0;
+pub const MEDIA_PRESS_IN_MS: f32 = 70.0;
+pub const MEDIA_PRESS_RELEASE_MS: f32 = 180.0;
+/// Press compresses the icon to this scale.
+pub const MEDIA_PRESS_ICON_SCALE: f32 = 0.84;
+/// New track content (artwork + text) fades in from this opacity...
+pub const MEDIA_TRACK_FADE_FLOOR: f32 = 0.35;
+/// ...over this duration (ease-out). Shares the control feedback timer.
+pub const MEDIA_TRACK_FADE_MS: f32 = 180.0;
+pub const MEDIA_FEEDBACK_TIMER_ID: usize = 1003;
+pub const MEDIA_FEEDBACK_FRAME_MS: u32 = 16;
+/// Playback "live" timer (visualizer + scrubber): runs only while playing or
+/// while the visualizer fades out, at a modest ~30 fps.
+pub const MEDIA_LIVE_TIMER_ID: usize = 1004;
+pub const MEDIA_LIVE_FRAME_MS: u32 = 33;
+
+/// Playback visualizer: thin rounded bars (DIP at 96 DPI).
+pub const BASE_VISUALIZER_BAR_WIDTH: f32 = 2.0;
+pub const BASE_VISUALIZER_BAR_GAP: f32 = 2.0;
+pub const BASE_VISUALIZER_HEIGHT: f32 = 12.0;
+/// Resting bar height as a fraction of the full height.
+pub const VISUALIZER_MIN_HEIGHT: f32 = 0.25;
+/// Fade in on play / out on pause.
+pub const VISUALIZER_FADE_MS: f32 = 220.0;
+/// Space between the title and the expanded visualizer.
+pub const BASE_MEDIA_VISUALIZER_GAP: f32 = 8.0;
+
+/// Inline scrubber in the controls row: `[controls]  0:49 ━━━●── -2:08`.
+pub const BASE_MEDIA_TIMELINE_LEAD: f32 = 4.0;
+pub const BASE_MEDIA_TIMELINE_LABEL_WIDTH: f32 = 34.0;
+pub const BASE_MEDIA_TIMELINE_LABEL_GAP: f32 = 7.0;
+pub const BASE_MEDIA_TIMELINE_TRACK: f32 = 5.0;
+pub const BASE_MEDIA_TIMELINE_FONT_SIZE: f32 = 10.0;
+/// Narrowest track worth drawing; below this the scrubber is omitted.
+pub const BASE_MEDIA_TIMELINE_MIN_TRACK: f32 = 24.0;
 pub const BASE_SEPARATOR_MARGIN_TOP: f32 = 6.0;
 pub const BASE_PREVIEW_MARGIN_TOP: f32 = 8.0;
 
@@ -131,6 +271,41 @@ pub const COLOR_TRANSPARENT: D2D1_COLOR_F = D2D1_COLOR_F {
 // Aliases for seamless Phase 1 compatibility
 pub const NOTCH_BG_COLOR: D2D1_COLOR_F = COLOR_SURFACE_AMOLED;
 pub const NOTCH_BORDER_COLOR: D2D1_COLOR_F = COLOR_BORDER_SUBTLE;
+
+/// Control backdrop at full hover (scaled by hover/press level; control-local only)
+pub const COLOR_MEDIA_CONTROL_HOVER: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 1.0,
+    g: 1.0,
+    b: 1.0,
+    a: 0.07,
+};
+
+/// Near-invisible artwork edge so dark covers keep their shape on #000
+pub const COLOR_ARTWORK_HAIRLINE: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 1.0,
+    g: 1.0,
+    b: 1.0,
+    a: 0.08,
+};
+
+/// Unplayed part of the scrubber track: dark neutral on #000
+pub const COLOR_MEDIA_TRACK_UNPLAYED: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 1.0,
+    g: 1.0,
+    b: 1.0,
+    a: 0.16,
+};
+
+/// Additional backdrop alpha while a control is pressed
+pub const MEDIA_CONTROL_PRESS_ALPHA: f32 = 0.06;
+
+/// Quiet tertiary text (source app, secondary date); ~5.7:1 on #000
+pub const COLOR_TEXT_TERTIARY: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 0.52,
+    g: 0.52,
+    b: 0.55,
+    a: 1.0,
+};
 
 /// Subtle separator color token for expanded state divider line
 pub const COLOR_SEPARATOR: D2D1_COLOR_F = D2D1_COLOR_F {
@@ -339,6 +514,37 @@ impl NotchDimensions {
         self.width % 2 == 0 || self.width > 0
     }
 
+    /// Bottom-corner smoothing, 0 (collapsed: exact circle) ..= 1 (expanded:
+    /// continuous corner). Derived from the current logical bottom radius, so it
+    /// follows the existing animation interpolation with no extra state.
+    pub fn bottom_smoothing(&self) -> f32 {
+        if self.scale <= 0.0 {
+            return 0.0;
+        }
+        let r = self.curvature.bottom_radius / self.scale;
+        let s = ((r - BASE_COLLAPSED_BOTTOM_CORNER_RADIUS)
+            / (BASE_EXPANDED_BOTTOM_CORNER_RADIUS - BASE_COLLAPSED_BOTTOM_CORNER_RADIUS))
+            .clamp(0.0, 1.0);
+        // Snap float noise from DPI scaling so the settled states are exact
+        if s < 1e-3 {
+            0.0
+        } else if s > 1.0 - 1e-3 {
+            1.0
+        } else {
+            s
+        }
+    }
+
+    /// Bottom-corner curve shared by rendering and hit testing.
+    pub fn bottom_corner_profile(&self) -> CornerProfile {
+        let max_span = (self.notch_height() / 2.0).min(self.notch_width() / 4.0);
+        CornerProfile::new(
+            self.curvature.bottom_radius.max(0.0).min(max_span),
+            self.bottom_smoothing(),
+            max_span,
+        )
+    }
+
     /// Hit-tests whether a client coordinate point (px, py) is inside the hardware notch body
     #[inline]
     pub fn contains_point(&self, px: f32, py: f32) -> bool {
@@ -348,6 +554,18 @@ impl NotchDimensions {
 
         if px < pad_x || px > (pad_x + notch_w) || py > notch_h {
             return false;
+        }
+
+        if self.bottom_smoothing() > 0.0 {
+            return is_point_in_notch_profile(
+                px - pad_x,
+                py,
+                notch_w,
+                notch_h,
+                self.curvature.top_transition_radius,
+                self.curvature.top_transition_height,
+                self.bottom_corner_profile(),
+            );
         }
 
         is_point_in_notch_ex(
@@ -457,6 +675,47 @@ pub fn is_point_in_notch_ex(
 
     // 4. Central body of the notch
     true
+}
+
+/// Hit test for a notch whose bottom corners follow `bottom` (the same curve the
+/// renderer draws). Shoulders and walls are identical to `is_point_in_notch_ex`.
+pub fn is_point_in_notch_profile(
+    px: f32,
+    py: f32,
+    width: f32,
+    height: f32,
+    top_transition_radius: f32,
+    top_transition_height: f32,
+    bottom: CornerProfile,
+) -> bool {
+    let span = bottom.span;
+    let r_top_x = top_transition_radius
+        .max(0.0)
+        .min(height / 2.0)
+        .min(width / 4.0);
+    // Everything except the bottom corners: reuse the circle version with no corner
+    if !is_point_in_notch_ex(
+        px,
+        py,
+        width,
+        height,
+        top_transition_radius,
+        top_transition_height,
+        0.0,
+    ) {
+        return false;
+    }
+    if span <= 0.0 || py <= height - span {
+        return true;
+    }
+    let v = py - (height - span);
+    let left_u = px - r_top_x;
+    let right_u = (width - r_top_x) - px;
+    let u = left_u.min(right_u);
+    if u >= span {
+        return true;
+    }
+    u >= bottom.inset_at(v)
 }
 
 /// Backward-compatible hit testing assuming equal horizontal and vertical top transition radii.
@@ -1134,7 +1393,7 @@ mod tests {
         assert_eq!(BASE_WIDTH, BASE_COLLAPSED_WIDTH);
         assert_eq!(BASE_HEIGHT, BASE_COLLAPSED_HEIGHT);
         assert_eq!(BASE_EXPANDED_WIDTH, 600.0);
-        assert_eq!(BASE_EXPANDED_HEIGHT, 120.0);
+        assert_eq!(BASE_EXPANDED_HEIGHT, 128.0);
 
         // Typography and icon scaling at 150% (144 DPI)
         let dims_150 = NotchDimensions::from_dpi(144);
@@ -1158,14 +1417,16 @@ mod tests {
         // 100% scaling: 96 DPI
         let dims_100 = NotchDimensions::from_state_and_dpi(NotchState::Expanded, 96);
         assert_eq!(dims_100.width, 600);
-        assert_eq!(dims_100.height, 120);
+        assert_eq!(dims_100.height, 128);
         assert_eq!(dims_100.state, NotchState::Expanded);
-        assert!((dims_100.corner_radius - 28.0).abs() < 1e-4);
-        assert!((dims_100.curvature.bottom_radius - 28.0).abs() < 1e-4);
+        assert!((dims_100.corner_radius - BASE_EXPANDED_BOTTOM_CORNER_RADIUS).abs() < 1e-4);
+        assert!(
+            (dims_100.curvature.bottom_radius - BASE_EXPANDED_BOTTOM_CORNER_RADIUS).abs() < 1e-4
+        );
         assert!((dims_100.curvature.top_transition_radius - 14.0).abs() < 1e-4);
         assert!((dims_100.curvature.top_transition_height - 14.0).abs() < 1e-4);
         assert_eq!(dims_100.shadow_margin_x, 10.0);
-        assert_eq!(dims_100.shadow_margin_bottom, 10.0);
+        assert_eq!(dims_100.shadow_margin_bottom, 18.0);
         assert_eq!(dims_100.notch_width(), 580.0);
         assert_eq!(dims_100.notch_height(), 110.0);
         assert_eq!(dims_100.padding_h, 18.0);
@@ -1174,36 +1435,48 @@ mod tests {
         // 125% scaling: 120 DPI
         let dims_125 = NotchDimensions::from_state_and_dpi(NotchState::Expanded, 120);
         assert_eq!(dims_125.width, 750);
-        assert_eq!(dims_125.height, 150);
-        assert!((dims_125.corner_radius - 35.0).abs() < 1e-4);
-        assert!((dims_125.curvature.bottom_radius - 35.0).abs() < 1e-4);
+        assert_eq!(dims_125.height, 160);
+        assert!((dims_125.corner_radius - BASE_EXPANDED_BOTTOM_CORNER_RADIUS * 1.25).abs() < 1e-4);
+        assert!(
+            (dims_125.curvature.bottom_radius - BASE_EXPANDED_BOTTOM_CORNER_RADIUS * 1.25).abs()
+                < 1e-4
+        );
         assert!((dims_125.curvature.top_transition_radius - 17.5).abs() < 1e-4);
         assert!((dims_125.curvature.top_transition_height - 17.5).abs() < 1e-4);
 
         // 150% scaling: 144 DPI
         let dims_150 = NotchDimensions::from_state_and_dpi(NotchState::Expanded, 144);
         assert_eq!(dims_150.width, 900);
-        assert_eq!(dims_150.height, 180);
-        assert!((dims_150.corner_radius - 42.0).abs() < 1e-4);
-        assert!((dims_150.curvature.bottom_radius - 42.0).abs() < 1e-4);
+        assert_eq!(dims_150.height, 192);
+        assert!((dims_150.corner_radius - BASE_EXPANDED_BOTTOM_CORNER_RADIUS * 1.5).abs() < 1e-4);
+        assert!(
+            (dims_150.curvature.bottom_radius - BASE_EXPANDED_BOTTOM_CORNER_RADIUS * 1.5).abs()
+                < 1e-4
+        );
         assert!((dims_150.curvature.top_transition_radius - 21.0).abs() < 1e-4);
         assert!((dims_150.curvature.top_transition_height - 21.0).abs() < 1e-4);
 
         // 175% scaling: 168 DPI
         let dims_175 = NotchDimensions::from_state_and_dpi(NotchState::Expanded, 168);
         assert_eq!(dims_175.width, 1050);
-        assert_eq!(dims_175.height, 210);
-        assert!((dims_175.corner_radius - 49.0).abs() < 1e-4);
-        assert!((dims_175.curvature.bottom_radius - 49.0).abs() < 1e-4);
+        assert_eq!(dims_175.height, 224);
+        assert!((dims_175.corner_radius - BASE_EXPANDED_BOTTOM_CORNER_RADIUS * 1.75).abs() < 1e-4);
+        assert!(
+            (dims_175.curvature.bottom_radius - BASE_EXPANDED_BOTTOM_CORNER_RADIUS * 1.75).abs()
+                < 1e-4
+        );
         assert!((dims_175.curvature.top_transition_radius - 24.5).abs() < 1e-4);
         assert!((dims_175.curvature.top_transition_height - 24.5).abs() < 1e-4);
 
         // 200% scaling: 192 DPI
         let dims_200 = NotchDimensions::from_state_and_dpi(NotchState::Expanded, 192);
         assert_eq!(dims_200.width, 1200);
-        assert_eq!(dims_200.height, 240);
-        assert!((dims_200.corner_radius - 56.0).abs() < 1e-4);
-        assert!((dims_200.curvature.bottom_radius - 56.0).abs() < 1e-4);
+        assert_eq!(dims_200.height, 256);
+        assert!((dims_200.corner_radius - BASE_EXPANDED_BOTTOM_CORNER_RADIUS * 2.0).abs() < 1e-4);
+        assert!(
+            (dims_200.curvature.bottom_radius - BASE_EXPANDED_BOTTOM_CORNER_RADIUS * 2.0).abs()
+                < 1e-4
+        );
         assert!((dims_200.curvature.top_transition_radius - 28.0).abs() < 1e-4);
         assert!((dims_200.curvature.top_transition_height - 28.0).abs() < 1e-4);
 
@@ -1211,21 +1484,24 @@ mod tests {
         let dims_137 = NotchDimensions::from_state_and_dpi(NotchState::Expanded, 137);
         let scale_137 = 137.0f32 / 96.0;
         assert_eq!(dims_137.width, (600.0f32 * scale_137).round() as i32);
-        assert_eq!(dims_137.height, (120.0f32 * scale_137).round() as i32);
+        assert_eq!(dims_137.height, (128.0f32 * scale_137).round() as i32);
 
         // High DPI: 288 DPI
         let dims_288 = NotchDimensions::from_state_and_dpi(NotchState::Expanded, 288);
         assert_eq!(dims_288.width, 1800);
-        assert_eq!(dims_288.height, 360);
-        assert!((dims_288.corner_radius - 84.0).abs() < 1e-4);
-        assert!((dims_288.curvature.bottom_radius - 84.0).abs() < 1e-4);
+        assert_eq!(dims_288.height, 384);
+        assert!((dims_288.corner_radius - BASE_EXPANDED_BOTTOM_CORNER_RADIUS * 3.0).abs() < 1e-4);
+        assert!(
+            (dims_288.curvature.bottom_radius - BASE_EXPANDED_BOTTOM_CORNER_RADIUS * 3.0).abs()
+                < 1e-4
+        );
         assert!((dims_288.curvature.top_transition_radius - 42.0).abs() < 1e-4);
         assert!((dims_288.curvature.top_transition_height - 42.0).abs() < 1e-4);
 
         // Zero DPI fallback
         let dims_zero = NotchDimensions::from_state_and_dpi(NotchState::Expanded, 0);
         assert_eq!(dims_zero.width, 600);
-        assert_eq!(dims_zero.height, 120);
+        assert_eq!(dims_zero.height, 128);
         assert_eq!(dims_zero.dpi, 96);
     }
 
@@ -1403,7 +1679,7 @@ mod tests {
         match layout_e {
             crate::layout::ResolvedLayout::Expanded { bounds, components } => {
                 assert_eq!(bounds.width(), 600.0);
-                assert_eq!(bounds.height(), 120.0);
+                assert_eq!(bounds.height(), 128.0);
                 assert!(components.content_bounds.width() > 0.0);
                 assert!(components.time_bounds.width() > 0.0);
                 assert!(components.date_bounds.width() > 0.0);
@@ -1563,7 +1839,7 @@ mod tests {
 
         let dims = anim.current_dimensions(96);
         assert_eq!(dims.width, 600);
-        assert_eq!(dims.height, 120);
+        assert_eq!(dims.height, 128);
         assert_eq!(dims.state, NotchState::Expanded);
     }
 
@@ -1926,6 +2202,123 @@ mod tests {
             // Ratio of primary to secondary font sizes is strictly preserved across all DPIs
             let ratio = dims.font_size_primary / dims.font_size_secondary;
             assert!((ratio - (BASE_FONT_SIZE_PRIMARY / BASE_FONT_SIZE_SECONDARY)).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn test_corner_profile_circle_and_smooth() {
+        // smoothing 0 = the original circular corner exactly (collapsed unchanged)
+        let circle = CornerProfile::new(14.0, 0.0, 100.0);
+        assert_eq!(circle.span, 14.0);
+        assert!((circle.handle - 0.552_284_8).abs() < 1e-6);
+        // Midpoint of the cubic sits on the circle within Bezier-approximation error
+        let (x, y) = circle.point(0.5);
+        let d = ((x - 14.0).powi(2) + y.powi(2)).sqrt();
+        assert!(
+            (d - 14.0).abs() < 0.05,
+            "circle midpoint off by {}",
+            d - 14.0
+        );
+        // smoothing 1 = longer, continuous corner
+        let smooth = CornerProfile::new(34.0, 1.0, 100.0);
+        assert!((smooth.span - 34.0 * (1.0 + EXPANDED_CORNER_SPAN_EXTRA)).abs() < 1e-4);
+        assert!((smooth.handle - CORNER_HANDLE_SMOOTH).abs() < 1e-6);
+        // Endpoints land on the wall and the bottom edge; inset is monotonic
+        assert_eq!(smooth.point(0.0), (0.0, 0.0));
+        let (ex, ey) = smooth.point(1.0);
+        assert!((ex - smooth.span).abs() < 1e-3 && (ey - smooth.span).abs() < 1e-3);
+        let mut last = -1.0;
+        for i in 0..=20 {
+            let u = smooth.inset_at(smooth.span * i as f32 / 20.0);
+            assert!(u >= last - 1e-3, "inset not monotonic");
+            last = u;
+        }
+        // Span never exceeds the clamp
+        assert_eq!(CornerProfile::new(80.0, 1.0, 55.0).span, 55.0);
+    }
+
+    #[test]
+    fn test_expanded_corners_smooth_collapsed_unchanged() {
+        for dpi in [96, 120, 137, 144, 168, 192, 288] {
+            let c = NotchDimensions::from_state_and_dpi(NotchState::Collapsed, dpi);
+            assert_eq!(
+                c.bottom_smoothing(),
+                0.0,
+                "collapsed stays circular at {dpi}"
+            );
+            let e = NotchDimensions::from_state_and_dpi(NotchState::Expanded, dpi);
+            assert!(
+                (e.bottom_smoothing() - 1.0).abs() < 1e-4,
+                "expanded is smooth at {dpi}"
+            );
+            // Collapsed hit testing is the exact original circle test
+            let (w, h) = (c.notch_width(), c.notch_height());
+            for y in 0..=(h as i32) {
+                for x in 0..=(w as i32) {
+                    let (px, py) = (x as f32, y as f32);
+                    assert_eq!(
+                        c.contains_point(px, py),
+                        is_point_in_notch_ex(
+                            px,
+                            py,
+                            w,
+                            h,
+                            c.curvature.top_transition_radius,
+                            c.curvature.top_transition_height,
+                            c.curvature.bottom_radius,
+                        ),
+                        "collapsed hit test changed at ({x},{y}) {dpi} DPI"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_expanded_hit_test_follows_drawn_corner() {
+        let e = NotchDimensions::from_state_and_dpi(NotchState::Expanded, 96);
+        let p = e.bottom_corner_profile();
+        let (pad, h, w) = (e.shadow_margin_x, e.notch_height(), e.notch_width());
+        let wall = pad + e.curvature.top_transition_radius;
+        for i in 1..20 {
+            let (cx, cy) = p.point(i as f32 / 20.0);
+            let (x, y) = (wall + cx, h - p.span + cy);
+            assert!(
+                e.contains_point(x + 0.75, y - 0.75),
+                "just inside curve at t={i}/20"
+            );
+            assert!(
+                !e.contains_point(x - 0.75, y + 0.75),
+                "just outside curve at t={i}/20"
+            );
+            // Mirror: right corner
+            let xr = pad + w - e.curvature.top_transition_radius - cx;
+            assert!(e.contains_point(xr - 0.75, y - 0.75));
+            assert!(!e.contains_point(xr + 0.75, y + 0.75));
+        }
+    }
+
+    #[test]
+    fn test_corner_smoothing_is_continuous_through_animation() {
+        for target in [NotchState::Expanded, NotchState::Collapsed] {
+            let start = match target {
+                NotchState::Expanded => NotchState::Collapsed,
+                NotchState::Collapsed => NotchState::Expanded,
+            };
+            let mut anim = AnimationState::new(start, target);
+            let mut prev = anim.current_dimensions(120).bottom_smoothing();
+            for step in 1..=50 {
+                anim.set_progress(step as f32 / 50.0);
+                let s = anim.current_dimensions(120).bottom_smoothing();
+                assert!((s - prev).abs() < 0.2, "smoothing jumped {prev} -> {s}");
+                prev = s;
+            }
+            let end = if target == NotchState::Expanded {
+                1.0
+            } else {
+                0.0
+            };
+            assert!((prev - end).abs() < 1e-4);
         }
     }
 }

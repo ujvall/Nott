@@ -1,1 +1,4 @@
 /target
+.claude/
+graphify-out/
+CLAUDE.md
