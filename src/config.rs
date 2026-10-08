@@ -275,6 +275,17 @@ pub const BASE_CLIPBOARD_ROW_OUTLINE: f32 = 1.0;
 /// Icon button growth at full hover / full press (fractions, additive).
 pub const CLIPBOARD_BUTTON_HOVER_GROW: f32 = 0.16;
 pub const CLIPBOARD_BUTTON_PRESS_GROW: f32 = 0.12;
+/// Settings page (DIP): its section label and the one setting row (title,
+/// description, switch). Drawn inside whichever space's size is active.
+pub const BASE_SETTINGS_LABEL_HEIGHT: f32 = 16.0;
+pub const BASE_SETTINGS_LABEL_GAP: f32 = 6.0;
+pub const BASE_SETTINGS_TITLE_HEIGHT: f32 = 18.0;
+pub const BASE_SETTINGS_DESCRIPTION_HEIGHT: f32 = 16.0;
+pub const BASE_SETTINGS_TOGGLE_WIDTH: f32 = 34.0;
+pub const BASE_SETTINGS_TOGGLE_HEIGHT: f32 = 20.0;
+pub const BASE_SETTINGS_TOGGLE_KNOB_INSET: f32 = 2.0;
+pub const BASE_SETTINGS_TOGGLE_GAP: f32 = 12.0;
+
 /// Longest text preview kept for a row (characters; DirectWrite ellipsizes).
 pub const CLIPBOARD_PREVIEW_CHARS: usize = 160;
 

@@ -25,9 +25,14 @@ use crate::config::{
     BASE_VISUALIZER_BAR_WIDTH, BASE_VISUALIZER_HEIGHT, NotchDimensions, NotchState,
     SKIP_GLYPH_HALF_WIDTH,
 };
+use crate::config::{
+    BASE_SETTINGS_DESCRIPTION_HEIGHT, BASE_SETTINGS_LABEL_GAP, BASE_SETTINGS_LABEL_HEIGHT,
+    BASE_SETTINGS_TITLE_HEIGHT, BASE_SETTINGS_TOGGLE_GAP, BASE_SETTINGS_TOGGLE_HEIGHT,
+    BASE_SETTINGS_TOGGLE_WIDTH,
+};
 use crate::media::MediaControl;
 use crate::media::VISUALIZER_BARS;
-use crate::space::NottSpace;
+use crate::space::{NottSpace, Scene};
 
 /// Floating-point axis-aligned rectangle for layout computation
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -101,12 +106,15 @@ pub struct CollapsedLayout {
     pub visualizer_bounds: RectF,
 }
 
-/// Space selector capsules (Home, Music, Clipboard) in the expanded notch's top band.
+/// Space selector capsules (Home, Music, Clipboard) in the expanded notch's
+/// top band, and the Settings icon at the band's right end.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpaceSelectorLayout {
     pub home: RectF,
     pub music: RectF,
     pub clipboard: RectF,
+    /// Settings icon (a band-height square at the right content edge).
+    pub settings: RectF,
 }
 
 impl SpaceSelectorLayout {
@@ -123,6 +131,7 @@ impl SpaceSelectorLayout {
             home: f(self.home),
             music: f(self.music),
             clipboard: f(self.clipboard),
+            settings: f(self.settings),
         }
     }
 
@@ -166,10 +175,12 @@ pub fn resolve_space_selector_in(
         let l = left + i * (w + px(BASE_SPACE_PILL_GAP));
         RectF::new(l, top, l + w, top + h)
     };
+    let right = (dimensions.width as f32 - wall - px(inset)).round();
     Some(SpaceSelectorLayout {
         home,
         music: pill(1.0),
         clipboard: pill(2.0),
+        settings: RectF::new(right - h, top, right, top + h),
     })
 }
 
@@ -180,30 +191,93 @@ pub fn resolve_space_selector_in(
 /// settled selector. Returns the pills and the highlight.
 pub fn blended_selector(
     dimensions: &NotchDimensions,
-    from: NottSpace,
-    to: NottSpace,
+    from: Scene,
+    to: Scene,
+    space: NottSpace,
     mix: f32,
 ) -> Option<(SpaceSelectorLayout, RectF)> {
     if dimensions.state != NotchState::Expanded {
         return None;
     }
-    let place = |space: NottSpace| {
+    // Settings and the drop page sit over the active space's layout
+    let space_of = |scene: Scene| match scene {
+        Scene::Space(s) => s,
+        Scene::Settings | Scene::Drop => space,
+    };
+    let place = |scene: Scene| {
+        let space = space_of(scene);
         let settled = space_dimensions(NotchState::Expanded, dimensions.dpi, space);
         let dx = ((dimensions.width - settled.width) as f32 / 2.0).round();
-        resolve_space_selector_in(&settled, space).map(|s| s.map(|r| r.offset_x(dx)))
+        let sel = resolve_space_selector_in(&settled, space)?.map(|r| r.offset_x(dx));
+        // Highlight: the space's pill, or the Settings icon on Settings
+        let highlight = match scene {
+            Scene::Settings => sel.settings,
+            _ => sel.bounds(space),
+        };
+        Some((sel, highlight))
     };
-    let (a, b) = (place(from)?, place(to)?);
+    let ((a, ha), (b, hb)) = (place(from)?, place(to)?);
     let pills = SpaceSelectorLayout {
         home: a.home.lerp(b.home, mix),
         music: a.music.lerp(b.music, mix),
         clipboard: a.clipboard.lerp(b.clipboard, mix),
+        settings: a.settings.lerp(b.settings, mix),
     };
-    Some((pills, a.bounds(from).lerp(b.bounds(to), mix)))
+    Some((pills, ha.lerp(hb, mix)))
+}
+
+/// The Settings page: a section label, then the one setting row (title,
+/// description, switch at the right content edge).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SettingsLayout {
+    pub label: RectF,
+    pub title: RectF,
+    pub description: RectF,
+    pub toggle: RectF,
+}
+
+/// Resolves the Settings page inside expanded dimensions (None when collapsed).
+pub fn resolve_settings_layout(dimensions: &NotchDimensions) -> Option<SettingsLayout> {
+    let ResolvedLayout::Expanded { components, .. } = resolve_layout(dimensions) else {
+        return None;
+    };
+    let px = |v: f32| (v * dimensions.scale).round();
+    let wall = dimensions.shadow_margin_x + dimensions.curvature.top_transition_radius;
+    let inset = px(BASE_CLIPBOARD_SIDE_INSET);
+    let (left, right) = (
+        (wall + inset).round(),
+        (dimensions.width as f32 - wall - inset).round(),
+    );
+    let top = components.content_bounds.top.round();
+    let label = RectF::new(left, top, right, top + px(BASE_SETTINGS_LABEL_HEIGHT));
+    let row_top = label.bottom + px(BASE_SETTINGS_LABEL_GAP);
+    let (title_h, desc_h) = (
+        px(BASE_SETTINGS_TITLE_HEIGHT),
+        px(BASE_SETTINGS_DESCRIPTION_HEIGHT),
+    );
+    let (tw, th) = (
+        px(BASE_SETTINGS_TOGGLE_WIDTH),
+        px(BASE_SETTINGS_TOGGLE_HEIGHT),
+    );
+    let toggle_top = (row_top + (title_h + desc_h - th) / 2.0).round();
+    let toggle = RectF::new(right - tw, toggle_top, right, toggle_top + th);
+    let text_right = (toggle.left - px(BASE_SETTINGS_TOGGLE_GAP)).max(left);
+    let title = RectF::new(left, row_top, text_right, row_top + title_h);
+    Some(SettingsLayout {
+        label,
+        title,
+        description: RectF::new(left, title.bottom, text_right, title.bottom + desc_h),
+        toggle,
+    })
 }
 
 /// What a click in the Clipboard space lands on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClipboardHit {
+pub enum PanelHit {
+    /// The header's Settings icon: opens / closes the Settings page.
+    Settings,
+    /// The Settings page's Always-on-top switch.
+    AlwaysOnTop,
     /// A history entry's outlined box (index into `ClipboardHistory`, newest
     /// first): restores it.
     Row(usize),
@@ -215,7 +289,7 @@ pub enum ClipboardHit {
     Clear,
 }
 
-impl ClipboardHit {
+impl PanelHit {
     /// Icon buttons (they grow on hover/press); a row box is not one.
     pub fn is_button(self) -> bool {
         !matches!(self, Self::Row(_))
@@ -253,9 +327,9 @@ impl ClipboardLayout {
     /// Only what is drawn is interactive: the boxes and buttons of rows holding
     /// an entry (of `len`), and the X while there is history. Everything else
     /// is notch background.
-    pub fn hit(&self, px: f32, py: f32, len: usize) -> Option<ClipboardHit> {
+    pub fn hit(&self, px: f32, py: f32, len: usize) -> Option<PanelHit> {
         if len > 0 && self.clear.contains(px, py) {
-            return Some(ClipboardHit::Clear);
+            return Some(PanelHit::Clear);
         }
         let i = self
             .rows
@@ -264,11 +338,11 @@ impl ClipboardLayout {
             .position(|r| r.contains(px, py))?;
         let (entry, copy, trash) = Self::row_parts(self.rows[i]);
         if trash.contains(px, py) {
-            Some(ClipboardHit::Remove(i))
+            Some(PanelHit::Remove(i))
         } else if copy.contains(px, py) {
-            Some(ClipboardHit::Copy(i))
+            Some(PanelHit::Copy(i))
         } else {
-            entry.contains(px, py).then_some(ClipboardHit::Row(i))
+            entry.contains(px, py).then_some(PanelHit::Row(i))
         }
     }
 }
@@ -286,7 +360,15 @@ pub fn resolve_clipboard_layout(dimensions: &NotchDimensions) -> Option<Clipboar
         (wall + inset).round(),
         (dimensions.width as f32 - wall - inset).round(),
     );
-    let clear = RectF::new(right - band.height(), band.top, right, band.bottom);
+    // The X sits just left of the header's Settings icon
+    let gear = resolve_space_selector_in(dimensions, NottSpace::Clipboard)?.settings;
+    let clear_right = gear.left - px(BASE_SPACE_PILL_GAP);
+    let clear = RectF::new(
+        clear_right - band.height(),
+        band.top,
+        clear_right,
+        band.bottom,
+    );
     let top = components.content_bounds.top.round();
     let (h, gap) = (px(BASE_CLIPBOARD_ROW_HEIGHT), px(BASE_CLIPBOARD_ROW_GAP));
     let rows = std::array::from_fn(|i| {
@@ -1822,28 +1904,94 @@ mod tests {
     }
 
     #[test]
+    fn test_settings_icon_at_the_right_end_of_every_header() {
+        for dpi in ALL_DPIS {
+            for space in NottSpace::ALL {
+                let dims = space_dimensions(NotchState::Expanded, dpi, space);
+                let sel = resolve_space_selector_in(&dims, space).unwrap();
+                let gear = sel.settings;
+                // Same row and height as the pills, right of all of them
+                assert_eq!((gear.top, gear.bottom), (sel.home.top, sel.home.bottom));
+                assert!(gear.left > sel.clipboard.right, "{space:?} at {dpi}");
+                for (x, y) in corners(&gear) {
+                    assert!(dims.contains_point(x, y), "{space:?} gear inside at {dpi}");
+                }
+                // Not a space pill
+                let (cx, cy) = (
+                    (gear.left + gear.right) / 2.0,
+                    (gear.top + gear.bottom) / 2.0,
+                );
+                assert_eq!(sel.space_at(cx, cy), None);
+                // On the Settings page the highlight sits on the icon
+                let (_, hi) =
+                    blended_selector(&dims, Scene::Settings, Scene::Settings, space, 1.0).unwrap();
+                assert_eq!(hi, gear);
+            }
+            // Clipboard's clear X moves just left of the icon
+            let dims = space_dimensions(NotchState::Expanded, dpi, NottSpace::Clipboard);
+            let gear = resolve_space_selector_in(&dims, NottSpace::Clipboard)
+                .unwrap()
+                .settings;
+            let clear = resolve_clipboard_layout(&dims).unwrap().clear;
+            assert!(clear.right < gear.left && !overlaps(&clear, &gear));
+        }
+    }
+
+    #[test]
+    fn test_settings_page_fits_every_space() {
+        for dpi in ALL_DPIS {
+            for space in NottSpace::ALL {
+                let dims = space_dimensions(NotchState::Expanded, dpi, space);
+                let l = resolve_settings_layout(&dims).unwrap();
+                let sel = resolve_space_selector_in(&dims, space).unwrap();
+                assert!(l.label.top >= sel.home.bottom, "below the header at {dpi}");
+                assert!(l.label.bottom <= l.title.top && l.title.bottom <= l.description.top);
+                assert!(l.title.right < l.toggle.left && l.description.right < l.toggle.left);
+                for r in [l.label, l.title, l.description, l.toggle] {
+                    for (x, y) in corners(&r) {
+                        assert!(dims.contains_point(x, y), "{space:?} {r:?} inside at {dpi}");
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            resolve_settings_layout(&NotchDimensions::from_state_and_dpi(
+                NotchState::Collapsed,
+                96
+            )),
+            None
+        );
+    }
+
+    #[test]
     fn test_blended_selector_glides_between_spaces() {
         for dpi in ALL_DPIS {
             for space in NottSpace::ALL {
                 let dims = space_dimensions(NotchState::Expanded, dpi, space);
                 let plain = resolve_space_selector_in(&dims, space).unwrap();
                 // Settled: exactly the plain selector, highlight on the space
-                let (sel, hi) = blended_selector(&dims, space, space, 1.0).unwrap();
+                let sc = Scene::Space(space);
+                let (sel, hi) = blended_selector(&dims, sc, sc, space, 1.0).unwrap();
                 assert_eq!((sel, hi), (plain, plain.bounds(space)));
             }
             // Mid Home -> Music: the highlight is between the two pills
             let dims =
                 space_dimensions(NotchState::Expanded, dpi, NottSpace::Home).with_width_dip(490.0);
-            let (a, _) = blended_selector(&dims, NottSpace::Home, NottSpace::Home, 1.0).unwrap();
-            let (b, _) = blended_selector(&dims, NottSpace::Music, NottSpace::Music, 1.0).unwrap();
-            let (_, hi) = blended_selector(&dims, NottSpace::Home, NottSpace::Music, 0.5).unwrap();
+            let (h, m) = (
+                Scene::Space(NottSpace::Home),
+                Scene::Space(NottSpace::Music),
+            );
+            let (a, _) = blended_selector(&dims, h, h, NottSpace::Home, 1.0).unwrap();
+            let (b, _) = blended_selector(&dims, m, m, NottSpace::Music, 1.0).unwrap();
+            let (_, hi) = blended_selector(&dims, h, m, NottSpace::Music, 0.5).unwrap();
             assert!(
                 hi.left > a.home.left.min(b.music.left) && hi.left < a.home.left.max(b.music.left)
             );
             assert!(
                 blended_selector(
                     &NotchDimensions::from_state_and_dpi(NotchState::Collapsed, dpi),
-                    NottSpace::Home,
+                    h,
+                    m,
                     NottSpace::Music,
                     0.5
                 )
@@ -1971,10 +2119,7 @@ mod tests {
         // Each row hits its own index while it holds an entry
         for (i, r) in l.rows.iter().enumerate() {
             let (x, y) = mid(*r);
-            assert_eq!(
-                l.hit(x, y, CLIPBOARD_VISIBLE_ROWS),
-                Some(ClipboardHit::Row(i))
-            );
+            assert_eq!(l.hit(x, y, CLIPBOARD_VISIBLE_ROWS), Some(PanelHit::Row(i)));
             assert_eq!(l.hit(x, y, i), None, "empty row slot is background");
         }
         // Row buttons sit inside the full-width box: copy restores, trash removes
@@ -1982,12 +2127,12 @@ mod tests {
         assert_eq!(entry, l.rows[2]);
         assert!(entry.left < copy.left && copy.right <= trash.left && trash.right < entry.right);
         let (x, y) = mid(copy);
-        assert_eq!(l.hit(x, y, 5), Some(ClipboardHit::Copy(2)));
+        assert_eq!(l.hit(x, y, 5), Some(PanelHit::Copy(2)));
         let (x, y) = mid(trash);
-        assert_eq!(l.hit(x, y, 5), Some(ClipboardHit::Remove(2)));
+        assert_eq!(l.hit(x, y, 5), Some(PanelHit::Remove(2)));
         assert_eq!(l.hit(x, y, 2), None, "no buttons on empty slots");
         let (x, y) = mid(l.clear);
-        assert_eq!(l.hit(x, y, 3), Some(ClipboardHit::Clear));
+        assert_eq!(l.hit(x, y, 3), Some(PanelHit::Clear));
         assert_eq!(l.hit(x, y, 0), None, "no Clear without history");
         // Gaps, the label and the margins are background
         let gap_y = (l.rows[0].bottom + l.rows[1].top) / 2.0;

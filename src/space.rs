@@ -19,7 +19,23 @@ pub enum NottSpace {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scene {
     Space(NottSpace),
+    /// The Settings page, over the active space (which stays selected).
+    Settings,
     Drop,
+}
+
+impl Scene {
+    /// What the expanded notch shows: an image drag's drop page first, then
+    /// an open Settings page, otherwise the active space.
+    pub fn current(drop_page: bool, settings_open: bool, space: NottSpace) -> Self {
+        if drop_page {
+            Self::Drop
+        } else if settings_open {
+            Self::Settings
+        } else {
+            Self::Space(space)
+        }
+    }
 }
 
 impl NottSpace {
@@ -78,6 +94,17 @@ mod tests {
             let target = NottSpace::ALL[i % 3];
             s.switch_to(target);
             assert_eq!(s, target, "repeated switching");
+        }
+    }
+
+    #[test]
+    fn test_scene_priority_and_settings_keep_the_space() {
+        for space in NottSpace::ALL {
+            assert_eq!(Scene::current(false, false, space), Scene::Space(space));
+            assert_eq!(Scene::current(false, true, space), Scene::Settings);
+            assert_eq!(Scene::current(true, true, space), Scene::Drop, "drag wins");
+            // Closing Settings returns to the space that was active
+            assert_eq!(Scene::current(false, false, space), Scene::Space(space));
         }
     }
 

@@ -57,7 +57,8 @@ use crate::config::{
 #[cfg(test)]
 use crate::layout::resolve_media_layout;
 use crate::layout::{
-    ClipboardHit, ClipboardLayout, blended_selector, resolve_clipboard_layout, space_dimensions,
+    ClipboardLayout, PanelHit, blended_selector, resolve_clipboard_layout, resolve_settings_layout,
+    space_dimensions,
 };
 use crate::layout::{
     CollapsedLayout, ExpandedLayout, MediaLayout, RectF, ResolvedLayout, resolve_collapsed_layout,
@@ -194,6 +195,10 @@ pub struct Renderer {
     drop_page: Cell<bool>,
     /// The running animation's content blend and opacity (None when settled).
     transition: Cell<Option<Transition>>,
+    /// Settings page open / Always-on-top value (mirror `WindowState`, which
+    /// sets them on every change).
+    settings_open: Cell<bool>,
+    always_on_top: Cell<bool>,
     /// Round-capped dashes of the drop page outline (device independent).
     drop_stroke: ID2D1StrokeStyle,
     /// Solid round caps and joins (the outline copy icon).
@@ -218,6 +223,11 @@ enum ClipRow {
     /// The entry's image (shared pixels) and its "Image · W × H" caption.
     Image(Artwork, Vec<u16>),
 }
+
+/// Settings page text.
+const SETTINGS_LABEL: &str = "Settings";
+const ALWAYS_ON_TOP_TITLE: &str = "Always on top";
+const ALWAYS_ON_TOP_DESCRIPTION: &str = "Keep Nott above other windows";
 
 /// Clipboard space empty state.
 const CLIPBOARD_EMPTY_LABEL: &str = "Copied text and images appear here";
@@ -567,15 +577,21 @@ impl Renderer {
         self.transition.set(transition);
     }
 
+    /// Mirrors the Settings page state and the Always-on-top value.
+    pub fn set_settings(&self, open: bool, always_on_top: bool) {
+        self.settings_open.set(open);
+        self.always_on_top.set(always_on_top);
+    }
+
     /// What this frame shows: the transition, or the settled scene at full
     /// opacity.
     fn scene_view(&self) -> Transition {
         self.transition.get().unwrap_or_else(|| {
-            let scene = if self.drop_page.get() {
-                Scene::Drop
-            } else {
-                Scene::Space(self.space.get())
-            };
+            let scene = Scene::current(
+                self.drop_page.get(),
+                self.settings_open.get(),
+                self.space.get(),
+            );
             Transition {
                 from: scene,
                 to: scene,
@@ -583,14 +599,6 @@ impl Renderer {
                 alpha: 1.0,
             }
         })
-    }
-
-    /// The space a scene belongs to (the drop page sits over the active one).
-    fn space_of(&self, scene: Scene) -> NottSpace {
-        match scene {
-            Scene::Space(space) => space,
-            Scene::Drop => self.space.get(),
-        }
     }
 
     /// Whether the drop page is showing (the window sizes the notch for it).
@@ -709,6 +717,8 @@ impl Renderer {
             thumbs: RefCell::new(Vec::new()),
             drop_page: Cell::new(false),
             transition: Cell::new(None),
+            settings_open: Cell::new(false),
+            always_on_top: Cell::new(true),
             drop_stroke,
         })
     }
@@ -1501,12 +1511,13 @@ impl Renderer {
         &self,
         rt: &ID2D1RenderTarget,
         dimensions: &NotchDimensions,
-        from: NottSpace,
-        to: NottSpace,
+        from: Scene,
+        to: Scene,
         mix: f32,
         alpha: f32,
     ) -> Result<()> {
-        let Some((selector, highlight)) = blended_selector(dimensions, from, to, mix) else {
+        let blended = blended_selector(dimensions, from, to, self.space.get(), mix);
+        let Some((selector, highlight)) = blended else {
             return Ok(());
         };
         self.paint_selector(rt, dimensions, &selector, highlight, alpha)
@@ -1551,6 +1562,15 @@ impl Renderer {
                 let (cx, cy) = ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
                 self.draw_space_icon(rt, space, cx, cy, u, brush)?;
             }
+            // Settings icon at the right end: same glyph size, grows a little
+            // on hover / press like the other icon buttons
+            let (hover, press) = self.feedback.borrow().clip_levels(PanelHit::Settings);
+            let grow = 1.0
+                + crate::config::CLIPBOARD_BUTTON_HOVER_GROW * hover
+                + crate::config::CLIPBOARD_BUTTON_PRESS_GROW * press;
+            let r = selector.settings;
+            let (cx, cy) = ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
+            self.draw_glyph(rt, GEAR, cx, cy, u * grow, &white)?;
         }
         Ok(())
     }
@@ -1768,8 +1788,7 @@ impl Renderer {
             let selector_alpha = 1.0 - weight(Scene::Drop);
             if selector_alpha > 0.0 {
                 let mix = if blending { t.mix } else { 1.0 };
-                let (from, to) = (self.space_of(t.from), self.space_of(t.to));
-                self.draw_selector_blended(rt, dims, from, to, mix, selector_alpha)?;
+                self.draw_selector_blended(rt, dims, t.from, t.to, mix, selector_alpha)?;
             }
             if !blending {
                 return self.draw_scene(rt, dims, clock, t.to);
@@ -1805,9 +1824,10 @@ impl Renderer {
         clock: &ClockDateState,
         scene: Scene,
     ) -> Result<()> {
-        let space = match scene {
+        let (space, settings) = match scene {
             Scene::Drop => return self.draw_drop_page(rt, dims),
-            Scene::Space(space) => space,
+            Scene::Settings => (self.space.get(), true),
+            Scene::Space(space) => (space, false),
         };
         let settled = space_dimensions(crate::config::NotchState::Expanded, dims.dpi, space);
         let ResolvedLayout::Expanded { components, .. } = resolve_layout(&settled) else {
@@ -1817,7 +1837,9 @@ impl Renderer {
         if dx != 0.0 {
             Self::set_offset(rt, dx);
         }
-        let drawn = if space == NottSpace::Clipboard {
+        let drawn = if settings {
+            self.draw_settings(rt, &settled)
+        } else if space == NottSpace::Clipboard {
             self.draw_clipboard(rt, &settled)
         } else {
             let media = self.media.borrow();
@@ -1845,6 +1867,84 @@ impl Renderer {
             Self::set_offset(rt, 0.0);
         }
         drawn
+    }
+
+    /// Settings page: a quiet "Settings" label, then the Always-on-top row
+    /// (title, description) with its switch at the right content edge.
+    fn draw_settings(&self, rt: &ID2D1RenderTarget, dimensions: &NotchDimensions) -> Result<()> {
+        let Some(l) = resolve_settings_layout(dimensions) else {
+            return Ok(());
+        };
+        let formats = self.media_formats(dimensions)?;
+        let on = self.always_on_top.get();
+        let px = |v: f32| (v * dimensions.scale).round();
+        let text = |s: &str, f: &IDWriteTextFormat, r: RectF, b| unsafe {
+            let s: Vec<u16> = s.encode_utf16().collect();
+            rt.DrawText(
+                &s,
+                f,
+                &r.to_d2d_rect(),
+                b,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        };
+        unsafe {
+            let primary = rt.CreateSolidColorBrush(&COLOR_TEXT_PRIMARY, None)?;
+            let tertiary = rt.CreateSolidColorBrush(&COLOR_TEXT_TERTIARY, None)?;
+            text(SETTINGS_LABEL, &formats.source, l.label, &tertiary);
+            text(ALWAYS_ON_TOP_TITLE, &formats.artist, l.title, &primary);
+            text(
+                ALWAYS_ON_TOP_DESCRIPTION,
+                &formats.source,
+                l.description,
+                &tertiary,
+            );
+            // Switch: white track with a black knob at the right when on; a
+            // faint track with a white knob at the left when off
+            let t = l.toggle;
+            let track = rt.CreateSolidColorBrush(
+                &if on {
+                    COLOR_TEXT_PRIMARY
+                } else {
+                    COLOR_SPACE_PILL_SELECTED
+                },
+                None,
+            )?;
+            rt.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: t.to_d2d_rect(),
+                    radiusX: t.height() / 2.0,
+                    radiusY: t.height() / 2.0,
+                },
+                &track,
+            );
+            let inset = px(crate::config::BASE_SETTINGS_TOGGLE_KNOB_INSET);
+            let d = t.height() - 2.0 * inset;
+            let left = if on {
+                t.right - inset - d
+            } else {
+                t.left + inset
+            };
+            let knob = RectF::new(left, t.top + inset, left + d, t.top + inset + d);
+            let knob_brush = rt.CreateSolidColorBrush(
+                if on {
+                    &NOTCH_BG_COLOR
+                } else {
+                    &COLOR_TEXT_PRIMARY
+                },
+                None,
+            )?;
+            rt.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: knob.to_d2d_rect(),
+                    radiusX: d / 2.0,
+                    radiusY: d / 2.0,
+                },
+                &knob_brush,
+            );
+        }
+        Ok(())
     }
 
     /// Home <-> Music with a session: cover, text and controls move between
@@ -1893,7 +1993,7 @@ impl Renderer {
             dimensions.height as f32 - dimensions.shadow_margin_bottom,
         );
         // Icon buttons grow smoothly with their hover / press levels
-        let grow = |b: ClipboardHit| {
+        let grow = |b: PanelHit| {
             let (hover, press) = self.feedback.borrow().clip_levels(b);
             1.0 + crate::config::CLIPBOARD_BUTTON_HOVER_GROW * hover
                 + crate::config::CLIPBOARD_BUTTON_PRESS_GROW * press
@@ -1923,8 +2023,7 @@ impl Renderer {
                 text(&empty, &formats.empty, l.list, &tertiary);
             } else {
                 let (cx, cy) = center(l.clear);
-                let u =
-                    px(crate::config::BASE_CLIPBOARD_CLEAR_ICON_SIZE) * grow(ClipboardHit::Clear);
+                let u = px(crate::config::BASE_CLIPBOARD_CLEAR_ICON_SIZE) * grow(PanelHit::Clear);
                 if let Err(e) = self.draw_cross(rt, cx, cy, u, &secondary) {
                     drawn = Err(e);
                 }
@@ -1934,7 +2033,7 @@ impl Renderer {
                 // Full-width outlined box; its copy / trash buttons fade in only
                 // while the row is hovered (one row at a time)
                 let (entry, copy, trash) = ClipboardLayout::row_parts(r);
-                let shown = self.feedback.borrow().clip_levels(ClipboardHit::Row(i)).0;
+                let shown = self.feedback.borrow().clip_levels(PanelHit::Row(i)).0;
                 let half = outline_w / 2.0;
                 rt.DrawRoundedRectangle(
                     &D2D1_ROUNDED_RECT {
@@ -1955,12 +2054,12 @@ impl Renderer {
                 if shown > 0.0 {
                     secondary.SetOpacity(shown);
                     let (cx, cy) = center(copy);
-                    let u = icon * grow(ClipboardHit::Copy(i));
+                    let u = icon * grow(PanelHit::Copy(i));
                     if let Err(e) = self.draw_copy_icon(rt, cx, cy, u, &secondary) {
                         drawn = Err(e);
                     }
                     let (cx, cy) = center(trash);
-                    let u = icon * grow(ClipboardHit::Remove(i));
+                    let u = icon * grow(PanelHit::Remove(i));
                     if let Err(e) = self.draw_glyph(rt, TRASH, cx, cy, u, &secondary) {
                         drawn = Err(e);
                     }
@@ -3203,6 +3302,66 @@ const CLIPBOARD: &[IconSeg] = &[
     IconSeg::C(0.2944, -0.3778, 0.2539, -0.4022, 0.205, -0.4133),
     IconSeg::Z,
 ];
+/// Flaticon UIcons solid-rounded `settings` (U+FBAC): the header's Settings icon.
+/// (Outline coordinates; a value near 1/pi is coincidence.)
+#[allow(clippy::approx_constant)]
+const GEAR: &[IconSeg] = &[
+    IconSeg::M(-0.4333, 0.25),
+    IconSeg::C(-0.4156, 0.2789, -0.39, 0.2983, -0.3567, 0.3083),
+    IconSeg::C(-0.3233, 0.3183, -0.2922, 0.3144, -0.2633, 0.2967),
+    IconSeg::L(-0.2433, 0.2867),
+    IconSeg::C(-0.2078, 0.3156, -0.1678, 0.3378, -0.1233, 0.3533),
+    IconSeg::L(-0.1233, 0.3733),
+    IconSeg::C(-0.1256, 0.4089, -0.1144, 0.4389, -0.09, 0.4633),
+    IconSeg::C(-0.0656, 0.4878, -0.0356, 0.5, 0.0, 0.5),
+    IconSeg::C(0.0356, 0.5, 0.0656, 0.4878, 0.09, 0.4633),
+    IconSeg::C(0.1144, 0.4389, 0.1256, 0.4089, 0.1233, 0.3733),
+    IconSeg::L(0.1233, 0.3533),
+    IconSeg::C(0.1678, 0.3378, 0.2078, 0.3156, 0.2433, 0.2867),
+    IconSeg::L(0.2633, 0.2967),
+    IconSeg::C(0.2922, 0.3144, 0.3233, 0.3183, 0.3567, 0.3083),
+    IconSeg::C(0.39, 0.2983, 0.4156, 0.2789, 0.4333, 0.25),
+    IconSeg::C(0.4511, 0.2211, 0.4556, 0.19, 0.4467, 0.1567),
+    IconSeg::C(0.4378, 0.1233, 0.4178, 0.0978, 0.3867, 0.08),
+    IconSeg::L(0.37, 0.07),
+    IconSeg::C(0.3767, 0.0233, 0.3767, -0.0233, 0.37, -0.07),
+    IconSeg::L(0.3867, -0.08),
+    IconSeg::C(0.4178, -0.0978, 0.4378, -0.1233, 0.4467, -0.1567),
+    IconSeg::C(0.4556, -0.19, 0.4511, -0.2211, 0.4333, -0.25),
+    IconSeg::C(0.4156, -0.2789, 0.39, -0.2983, 0.3567, -0.3083),
+    IconSeg::C(0.3233, -0.3183, 0.2922, -0.3144, 0.2633, -0.2967),
+    IconSeg::L(0.2433, -0.2867),
+    IconSeg::C(0.2078, -0.3156, 0.1678, -0.3378, 0.1233, -0.3533),
+    IconSeg::L(0.1233, -0.3767),
+    IconSeg::C(0.1233, -0.41, 0.1117, -0.4389, 0.0883, -0.4633),
+    IconSeg::C(0.065, -0.4878, 0.0356, -0.5, 0.0, -0.5),
+    IconSeg::C(-0.0356, -0.5, -0.065, -0.4878, -0.0883, -0.4633),
+    IconSeg::C(-0.1117, -0.4389, -0.1233, -0.4089, -0.1233, -0.3733),
+    IconSeg::L(-0.1233, -0.3533),
+    IconSeg::C(-0.1678, -0.3378, -0.2078, -0.3156, -0.2433, -0.2867),
+    IconSeg::L(-0.2633, -0.2967),
+    IconSeg::C(-0.2922, -0.3144, -0.3233, -0.3183, -0.3567, -0.3083),
+    IconSeg::C(-0.39, -0.2983, -0.4156, -0.2789, -0.4333, -0.25),
+    IconSeg::C(-0.4511, -0.2211, -0.4556, -0.19, -0.4467, -0.1567),
+    IconSeg::C(-0.4378, -0.1233, -0.4178, -0.0978, -0.3867, -0.08),
+    IconSeg::L(-0.3867, -0.08),
+    IconSeg::L(-0.37, -0.07),
+    IconSeg::C(-0.3767, -0.0233, -0.3767, 0.0233, -0.37, 0.07),
+    IconSeg::L(-0.3867, 0.08),
+    IconSeg::C(-0.4178, 0.0978, -0.4378, 0.1233, -0.4467, 0.1567),
+    IconSeg::C(-0.4556, 0.19, -0.4511, 0.2211, -0.4333, 0.25),
+    IconSeg::Z,
+    IconSeg::M(0.0, -0.1667),
+    IconSeg::C(0.0467, -0.1667, 0.0861, -0.1506, 0.1183, -0.1183),
+    IconSeg::C(0.1506, -0.0861, 0.1667, -0.0467, 0.1667, -0.0),
+    IconSeg::C(0.1667, 0.0467, 0.1506, 0.0861, 0.1183, 0.1183),
+    IconSeg::C(0.0861, 0.1506, 0.0467, 0.1667, 0.0, 0.1667),
+    IconSeg::C(-0.0467, 0.1667, -0.0861, 0.1506, -0.1183, 0.1183),
+    IconSeg::C(-0.1506, 0.0861, -0.1667, 0.0467, -0.1667, -0.0),
+    IconSeg::C(-0.1667, -0.0467, -0.1506, -0.0861, -0.1183, -0.1183),
+    IconSeg::C(-0.0861, -0.1506, -0.0467, -0.1667, 0.0, -0.1667),
+    IconSeg::Z,
+];
 /// Flaticon UIcons solid-rounded `trash` (U+FDDF): clipboard row delete button.
 const TRASH: &[IconSeg] = &[
     IconSeg::M(0.3767, -0.3333),
@@ -3308,7 +3467,7 @@ const INBOX: &[IconSeg] = &[
 mod tests {
     use super::*;
     use crate::config::NotchState;
-    use crate::layout::resolve_space_selector_in;
+    use crate::layout::{resolve_settings_layout, resolve_space_selector_in};
 
     #[test]
     fn test_renderer_initialization_and_drawing() {
@@ -6098,6 +6257,72 @@ mod tests {
         let (full, _) = transition_frame(&renderer, &mid, t(1.0));
         let (half, _) = transition_frame(&renderer, &mid, t(0.5));
         assert!(peak(&half) < peak(&full));
+    }
+
+    #[test]
+    fn test_settings_page_shows_the_switch_state_and_touches_nothing_else() {
+        let renderer = Renderer::new().expect("renderer");
+        let media = playing_content(crate::media::PlaybackState::Playing);
+        renderer.set_media(Some(&media));
+        let mut h = ClipboardHistory::default();
+        h.add(ClipboardItem::Text("kept".into()));
+        renderer.set_clipboard(&h);
+        let clock = ClockDateState::from_pure_components(2026, 10, 6, 2, 0, 47, 0, 0, false);
+        for space in NottSpace::ALL {
+            renderer.set_space(space);
+            let dims = crate::layout::space_dimensions(NotchState::Expanded, 120, space);
+            let l = resolve_settings_layout(&dims).unwrap();
+            let t = l.toggle;
+            let frame = |on| {
+                renderer.set_settings(true, on);
+                render_custom_frame(&renderer, &dims, |rt| {
+                    renderer.draw_expanded(rt, &dims, &clock).unwrap()
+                })
+            };
+            let at = |px: &[u32], stride: usize, x: f32| {
+                px[((t.top + t.bottom) / 2.0) as usize * stride + x as usize] & 0xFF
+            };
+            // On: white track, black knob at the right
+            let (px, stride) = frame(true);
+            assert!(lit_in(&px, stride, l.title, 120) && lit_in(&px, stride, l.label, 40));
+            assert!(
+                at(&px, stride, t.left + 4.0) > 200,
+                "{space:?} on: track lit"
+            );
+            assert!(
+                at(&px, stride, t.right - t.height() / 2.0) < 60,
+                "{space:?} on: dark knob"
+            );
+            // Off: white knob at the left, dim track on the right
+            let (px, stride) = frame(false);
+            assert!(
+                at(&px, stride, t.left + t.height() / 2.0) > 200,
+                "{space:?} off: knob"
+            );
+            assert!(
+                at(&px, stride, t.right - 4.0) < 80,
+                "{space:?} off: dim track"
+            );
+            // Settings content replaces the space's content (no media / rows)
+            if space == NottSpace::Clipboard {
+                let rows = resolve_clipboard_layout(&dims).unwrap().rows;
+                assert!(!lit_in(
+                    &px,
+                    stride,
+                    RectF::new(
+                        rows[2].left,
+                        rows[2].top,
+                        rows[2].right - 60.0,
+                        rows[2].bottom
+                    ),
+                    30
+                ));
+            }
+        }
+        renderer.set_settings(false, true);
+        // Nothing shared changed
+        assert_eq!(renderer.media.borrow().as_ref().unwrap().content, media);
+        assert_eq!(row_kinds(&renderer), ["text"]);
     }
 
     #[test]

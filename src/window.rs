@@ -42,10 +42,11 @@ use crate::config::{
     WINDOW_TITLE, calculate_notch_x,
 };
 use crate::dragdrop::{self, DragEvent, DragSession, DropTarget};
-use crate::layout::{ClipboardHit, MediaLayout, resolve_clipboard_layout};
+use crate::layout::{MediaLayout, PanelHit, resolve_clipboard_layout};
 use crate::layout::{
     blended_selector, expanded_size_dip, resolve_media_layout_in, space_dimensions,
 };
+use crate::layout::{resolve_settings_layout, resolve_space_selector_in};
 use crate::media::{
     MediaContent, MediaControl, MediaEngine, WM_APP_MEDIA_PLAYBACK_CHANGED,
     WM_APP_MEDIA_PROPERTIES_CHANGED, WM_APP_MEDIA_SESSION_CHANGED, is_media_message,
@@ -54,6 +55,9 @@ use crate::renderer::{DROP_PAGE_SPACE, Renderer};
 use crate::space::{NottSpace, Scene};
 use windows::Win32::System::Ole::{
     OleInitialize, OleUninitialize, RegisterDragDrop, RevokeDragDrop,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    HWND_NOTOPMOST, SET_WINDOW_POS_FLAGS, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
 };
 
 /// Owns the process's 1 ms timer-resolution request (`timeBeginPeriod`), held
@@ -122,6 +126,47 @@ struct WindowState {
     clipboard: ClipboardHistory,
     /// Active OLE drag over the notch (image-file drops into the history).
     drag: DragSession,
+    /// User settings (memory only; every launch starts from the defaults).
+    settings: NottSettings,
+    /// The Settings page is open over the active space (which stays selected).
+    settings_open: bool,
+}
+
+/// In-memory user settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NottSettings {
+    /// Topmost band (above normal windows). On by default: Nott has always
+    /// been a topmost window.
+    always_on_top: bool,
+}
+
+impl Default for NottSettings {
+    fn default() -> Self {
+        Self {
+            always_on_top: true,
+        }
+    }
+}
+
+/// `SetWindowPos` z-order arguments for routine moves and resizes: topmost
+/// re-asserts the topmost band; otherwise the z-order is left untouched
+/// (`SWP_NOZORDER`), so windows that covered Nott stay above it.
+fn z_order(always_on_top: bool) -> (Option<HWND>, SET_WINDOW_POS_FLAGS) {
+    if always_on_top {
+        (Some(HWND_TOPMOST), SET_WINDOW_POS_FLAGS(0))
+    } else {
+        (None, SWP_NOZORDER)
+    }
+}
+
+/// Where the setting moves the window when it flips: into the topmost band,
+/// or out of it (`HWND_NOTOPMOST`: top of the normal band, coverable).
+fn z_band(always_on_top: bool) -> HWND {
+    if always_on_top {
+        HWND_TOPMOST
+    } else {
+        HWND_NOTOPMOST
+    }
 }
 
 impl WindowState {
@@ -131,6 +176,7 @@ impl WindowState {
             || self.animation.is_some()
             || self.media_content.is_none()
             || self.space == NottSpace::Clipboard
+            || self.settings_open
         {
             return None;
         }
@@ -192,7 +238,9 @@ impl WindowState {
     /// visualizer, the Music space, or a notch animation (its frames show both
     /// ends). The settled Home expanded notch shows neither.
     fn live_visible(&self) -> bool {
-        self.animation.is_some() || self.state == NotchState::Collapsed || self.space.is_music()
+        self.animation.is_some()
+            || self.state == NotchState::Collapsed
+            || (self.space.is_music() && !self.settings_open)
     }
 
     /// Drops all control feedback immediately (e.g. when the notch toggles).
@@ -226,11 +274,7 @@ impl WindowState {
             }
             None => (self.scene(), self.scene(), 1.0),
         };
-        let space = |s: Scene| match s {
-            Scene::Space(space) => space,
-            Scene::Drop => self.space,
-        };
-        blended_selector(&self.dimensions, space(from), space(to), mix)?
+        blended_selector(&self.dimensions, from, to, self.space, mix)?
             .0
             .space_at(x, y)
     }
@@ -242,8 +286,14 @@ impl WindowState {
     /// expansion opens straight into its width.
     fn select_space(&mut self, hwnd: HWND, space: NottSpace) {
         let before = self.scene();
-        if self.space.switch_to(space) {
+        let changed = self.space.switch_to(space);
+        // A pill on the Settings page also closes it (back to that space)
+        let closed = std::mem::take(&mut self.settings_open);
+        if changed || closed {
             self.renderer.set_space(space);
+            self.renderer
+                .set_settings(false, self.settings.always_on_top);
+            self.kick_live(hwnd);
             // Controls move with the layout: drop stale hover/press
             self.reset_feedback(hwnd);
             self.resize_to_target(hwnd, before);
@@ -254,6 +304,7 @@ impl WindowState {
                 self.media_content.as_ref(),
                 self.space,
                 &self.clipboard,
+                self.settings_title(),
             );
         }
     }
@@ -271,11 +322,66 @@ impl WindowState {
     /// What the expanded notch shows: the drop page during an image drag,
     /// otherwise the active space.
     fn scene(&self) -> Scene {
-        if self.renderer.drop_page() {
-            Scene::Drop
-        } else {
-            Scene::Space(self.space)
+        Scene::current(self.renderer.drop_page(), self.settings_open, self.space)
+    }
+
+    /// The Settings page's accessible state (Some(always on top) while open).
+    fn settings_title(&self) -> Option<bool> {
+        self.settings_open.then_some(self.settings.always_on_top)
+    }
+
+    /// Opens / closes the Settings page over the active space: the content
+    /// blends on the existing space transition (same size), the selected
+    /// space, media and clipboard history are untouched.
+    fn set_settings_open(&mut self, hwnd: HWND, open: bool) {
+        if self.settings_open == open {
+            return;
         }
+        let before = self.scene();
+        self.settings_open = open;
+        self.renderer
+            .set_settings(open, self.settings.always_on_top);
+        self.resize_to_target(hwnd, before);
+        self.kick_live(hwnd);
+        notify_accessibility_state_changed(
+            hwnd,
+            self.state,
+            self.clock.state(),
+            self.media_content.as_ref(),
+            self.space,
+            &self.clipboard,
+            self.settings_title(),
+        );
+    }
+
+    /// Flips Always on top and applies it to this window at once: into or
+    /// out of the topmost band, keeping position, size, visibility and
+    /// activation (no window is recreated).
+    fn toggle_always_on_top(&mut self, hwnd: HWND) {
+        let on = !self.settings.always_on_top;
+        self.settings.always_on_top = on;
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                Some(z_band(on)),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+        self.renderer.set_settings(self.settings_open, on);
+        self.redraw(hwnd);
+        notify_accessibility_state_changed(
+            hwnd,
+            self.state,
+            self.clock.state(),
+            self.media_content.as_ref(),
+            self.space,
+            &self.clipboard,
+            self.settings_title(),
+        );
     }
 
     /// After the space or drop page changed (from showing `before`): the notch
@@ -315,12 +421,12 @@ impl WindowState {
             unsafe {
                 let _ = SetWindowPos(
                     hwnd,
-                    Some(HWND_TOPMOST),
+                    z_order(self.settings.always_on_top).0,
                     self.pos_x,
                     self.pos_y,
                     dims.width,
                     dims.height,
-                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW | z_order(self.settings.always_on_top).1,
                 );
             }
             return;
@@ -451,17 +557,31 @@ impl WindowState {
         }
     }
 
-    /// Clipboard row or Clear under a client-area point (settled Clipboard
-    /// space only; everything else there is notch background).
-    fn clipboard_hit(&self, lparam: LPARAM) -> Option<ClipboardHit> {
+    /// Panel control under a client-area point on the settled expanded notch:
+    /// the header's Settings icon; on the Settings page its switch; in the
+    /// Clipboard space a row, its buttons or Clear. Everything else is notch
+    /// background (the selector pills are `space_at`).
+    fn panel_hit(&self, lparam: LPARAM) -> Option<PanelHit> {
         if self.state != NotchState::Expanded
             || self.animation.is_some()
-            || self.space != NottSpace::Clipboard
+            || self.renderer.drop_page()
         {
             return None;
         }
         let x = (lparam.0 & 0xFFFF) as i16 as f32;
         let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+        let selector = resolve_space_selector_in(&self.dimensions, self.space)?;
+        if selector.settings.contains(x, y) {
+            return Some(PanelHit::Settings);
+        }
+        if self.settings_open {
+            // Only the switch is live on the Settings page
+            let toggle = resolve_settings_layout(&self.dimensions)?.toggle;
+            return toggle.contains(x, y).then_some(PanelHit::AlwaysOnTop);
+        }
+        if self.space != NottSpace::Clipboard {
+            return None;
+        }
         resolve_clipboard_layout(&self.dimensions)?.hit(x, y, self.clipboard.len())
     }
 
@@ -478,6 +598,7 @@ impl WindowState {
                 self.media_content.as_ref(),
                 self.space,
                 &self.clipboard,
+                self.settings_title(),
             );
         }
     }
@@ -528,7 +649,21 @@ fn accessible_title(
     media: Option<&MediaContent>,
     space: NottSpace,
     clipboard: &ClipboardHistory,
+    settings: Option<bool>,
 ) -> String {
+    if let (NotchState::Expanded, Some(on)) = (state, settings) {
+        let (state_word, switch) = if on {
+            ("enabled", "on")
+        } else {
+            ("disabled", "off")
+        };
+        return format!(
+            "Settings, Always on top {state_word} - Always on top switch, {switch} - {} - {} - {}",
+            clock.formatted_time,
+            clock.formatted_date,
+            accessible_space(space)
+        );
+    }
     if state != NotchState::Expanded || space != NottSpace::Clipboard {
         return accessible_title_for_clock(state, clock, media, space);
     }
@@ -590,8 +725,9 @@ fn notify_accessibility_state_changed(
     media: Option<&MediaContent>,
     space: NottSpace,
     clipboard: &ClipboardHistory,
+    settings: Option<bool>,
 ) {
-    let title = accessible_title(new_state, clock, media, space, clipboard);
+    let title = accessible_title(new_state, clock, media, space, clipboard, settings);
     let wide_title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         let _ = SetWindowTextW(hwnd, windows::core::PCWSTR(wide_title.as_ptr()));
@@ -608,8 +744,9 @@ fn notify_accessibility_clock_changed(
     media: Option<&MediaContent>,
     space: NottSpace,
     clipboard: &ClipboardHistory,
+    settings: Option<bool>,
 ) {
-    let title = accessible_title(state, clock, media, space, clipboard);
+    let title = accessible_title(state, clock, media, space, clipboard, settings);
     let wide_title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         let _ = SetWindowTextW(hwnd, windows::core::PCWSTR(wide_title.as_ptr()));
@@ -631,6 +768,13 @@ fn start_or_reverse_animation(hwnd: HWND, state: &mut WindowState) -> Result<()>
             NotchState::Expanded => NotchState::Collapsed,
         }
     };
+    // Collapsing closes the Settings page; the next expansion shows the space
+    if target_state == NotchState::Collapsed && state.settings_open {
+        state.settings_open = false;
+        state
+            .renderer
+            .set_settings(false, state.settings.always_on_top);
+    }
 
     if !is_client_animation_enabled() {
         // Reduced motion requested: snap immediately to target state without timer
@@ -688,12 +832,12 @@ fn start_or_reverse_animation(hwnd: HWND, state: &mut WindowState) -> Result<()>
         unsafe {
             SetWindowPos(
                 hwnd,
-                Some(HWND_TOPMOST),
+                z_order(state.settings.always_on_top).0,
                 new_x,
                 0,
                 new_dims.width,
                 new_dims.height,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW | z_order(state.settings.always_on_top).1,
             )?;
         }
 
@@ -704,6 +848,7 @@ fn start_or_reverse_animation(hwnd: HWND, state: &mut WindowState) -> Result<()>
             state.media_content.as_ref(),
             state.space,
             &state.clipboard,
+            state.settings_title(),
         );
         return Ok(());
     }
@@ -794,12 +939,12 @@ fn set_notch_state(hwnd: HWND, state: &mut WindowState, new_state: NotchState) -
     unsafe {
         SetWindowPos(
             hwnd,
-            Some(HWND_TOPMOST),
+            z_order(state.settings.always_on_top).0,
             new_x,
             new_y,
             new_dims.width,
             new_dims.height,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW | z_order(state.settings.always_on_top).1,
         )?;
     }
     notify_accessibility_state_changed(
@@ -809,6 +954,7 @@ fn set_notch_state(hwnd: HWND, state: &mut WindowState, new_state: NotchState) -
         state.media_content.as_ref(),
         state.space,
         &state.clipboard,
+        state.settings_title(),
     );
     Ok(())
 }
@@ -1069,6 +1215,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 state.media_content.as_ref(),
                                 state.space,
                                 &state.clipboard,
+                                state.settings_title(),
                             );
                         }
                         state.last_frame_time = None;
@@ -1077,12 +1224,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let _ = KillTimer(Some(hwnd), ANIMATION_TIMER_ID);
                             let _ = SetWindowPos(
                                 hwnd,
-                                Some(HWND_TOPMOST),
+                                z_order(state.settings.always_on_top).0,
                                 new_x,
                                 new_y,
                                 state.dimensions.width,
                                 state.dimensions.height,
-                                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                                SWP_NOACTIVATE
+                                    | SWP_SHOWWINDOW
+                                    | z_order(state.settings.always_on_top).1,
                             );
                         }
 
@@ -1204,6 +1353,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             state.media_content.as_ref(),
                             state.space,
                             &state.clipboard,
+                            state.settings_title(),
                         );
                         if state.animation.is_none() {
                             let _ = state.renderer.render(
@@ -1255,12 +1405,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     state.kick_feedback(hwnd);
                 }
                 // Clipboard: the hovered row shows its buttons; a hovered button grows
-                let hit = state.clipboard_hit(lparam);
+                let hit = state.panel_hit(lparam);
                 let row = hit.and_then(|h| match h {
-                    ClipboardHit::Row(i) | ClipboardHit::Copy(i) | ClipboardHit::Remove(i) => {
-                        Some(i)
-                    }
-                    ClipboardHit::Clear => None,
+                    PanelHit::Row(i) | PanelHit::Copy(i) | PanelHit::Remove(i) => Some(i),
+                    PanelHit::Clear | PanelHit::Settings | PanelHit::AlwaysOnTop => None,
                 });
                 let changed = {
                     let mut feedback = state.renderer.feedback();
@@ -1312,7 +1460,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                     // Press compresses smoothly on the shared feedback timer
                     state.kick_feedback(hwnd);
-                } else if let Some(button) = state.clipboard_hit(lparam).filter(|h| h.is_button()) {
+                } else if let Some(button) = state.panel_hit(lparam).filter(|h| h.is_button()) {
                     // Clipboard icon button: grows a little more while pressed
                     state.renderer.feedback().press_clip(button);
                     state.kick_feedback(hwnd);
@@ -1342,19 +1490,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     // Transport control: send to the current session; never toggles the notch.
                     // Resulting playback/metadata state arrives through media events.
                     state.media.send_command(control);
-                } else if let Some(hit) = state.clipboard_hit(lparam) {
-                    // Clipboard row: back onto the system clipboard and to the
-                    // front (no duplicate). Clear: forget the in-memory history
-                    // only. Neither toggles the notch or leaves the space.
+                } else if let Some(hit) = state.panel_hit(lparam) {
+                    // Settings icon: open / close the page. Switch: apply
+                    // Always on top. Clipboard row: back onto the system
+                    // clipboard and to the front (no duplicate). Clear: forget
+                    // the in-memory history only. None toggles the notch.
                     match hit {
-                        ClipboardHit::Row(index) | ClipboardHit::Copy(index) => {
+                        PanelHit::Settings => {
+                            let open = !state.settings_open;
+                            state.set_settings_open(hwnd, open);
+                            return;
+                        }
+                        PanelHit::AlwaysOnTop => {
+                            state.toggle_always_on_top(hwnd);
+                            return;
+                        }
+                        PanelHit::Row(index) | PanelHit::Copy(index) => {
                             // Clipboard busy: nothing changes; no retry
                             let _ = state.restore_clipboard(hwnd, index);
                         }
-                        ClipboardHit::Remove(index) => {
+                        PanelHit::Remove(index) => {
                             state.clipboard.remove(index);
                         }
-                        ClipboardHit::Clear => state.clipboard.clear(),
+                        PanelHit::Clear => state.clipboard.clear(),
                     }
                     state.clipboard_changed(hwnd);
                 } else if let Some(space) = state.space_at(lparam) {
@@ -1418,12 +1576,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         );
                         let _ = SetWindowPos(
                             hwnd,
-                            Some(HWND_TOPMOST),
+                            z_order(state.settings.always_on_top).0,
                             new_x,
                             new_y,
                             new_dims.width,
                             new_dims.height,
-                            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                            SWP_NOACTIVATE
+                                | SWP_SHOWWINDOW
+                                | z_order(state.settings.always_on_top).1,
                         );
                     }
                 }
@@ -1459,12 +1619,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         );
                         let _ = SetWindowPos(
                             hwnd,
-                            Some(HWND_TOPMOST),
+                            z_order(state.settings.always_on_top).0,
                             new_x,
                             new_y,
                             new_dims.width,
                             new_dims.height,
-                            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                            SWP_NOACTIVATE
+                                | SWP_SHOWWINDOW
+                                | z_order(state.settings.always_on_top).1,
                         );
                     }
                 }
@@ -1483,6 +1645,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         state.media_content.as_ref(),
                         state.space,
                         &state.clipboard,
+                        state.settings_title(),
                     );
                     if state.animation.is_none() {
                         let _ = state.renderer.render(
@@ -1516,6 +1679,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             state.media_content.as_ref(),
                             state.space,
                             &state.clipboard,
+                            state.settings_title(),
                         );
                         if state.animation.is_none() {
                             let _ = state.renderer.render(
@@ -1587,6 +1751,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 state.media_content.as_ref(),
                                 state.space,
                                 &state.clipboard,
+                                state.settings_title(),
                             );
                         }
                     }
@@ -1784,6 +1949,8 @@ fn run_window(ole: bool) -> Result<()> {
             live_tick: None,
             clipboard: ClipboardHistory::default(),
             drag: DragSession::default(),
+            settings: NottSettings::default(),
+            settings_open: false,
         });
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
 
@@ -2017,7 +2184,7 @@ mod tests {
         };
         let mut history = ClipboardHistory::default();
         let title = |h: &ClipboardHistory, state| {
-            accessible_title(state, &clock, Some(&media), NottSpace::Clipboard, h)
+            accessible_title(state, &clock, Some(&media), NottSpace::Clipboard, h, None)
         };
         assert_eq!(
             title(&history, NotchState::Expanded),
@@ -2043,10 +2210,86 @@ mod tests {
         assert_eq!(title(&history, NotchState::Collapsed), time);
         for s in [NottSpace::Home, NottSpace::Music] {
             assert_eq!(
-                accessible_title(NotchState::Expanded, &clock, Some(&media), s, &history),
+                accessible_title(
+                    NotchState::Expanded,
+                    &clock,
+                    Some(&media),
+                    s,
+                    &history,
+                    None
+                ),
                 accessible_title_for_clock(NotchState::Expanded, &clock, Some(&media), s)
             );
         }
+    }
+
+    #[test]
+    fn test_always_on_top_defaults_on_and_maps_to_z_order() {
+        let mut settings = NottSettings::default();
+        assert!(
+            settings.always_on_top,
+            "Nott starts topmost, as it always has"
+        );
+        // Routine moves keep the band: topmost re-asserted, or z-order untouched
+        assert_eq!(z_order(true), (Some(HWND_TOPMOST), SET_WINDOW_POS_FLAGS(0)));
+        assert_eq!(z_order(false), (None, SWP_NOZORDER));
+        // Flipping moves into / out of the topmost band
+        assert_eq!(z_band(true), HWND_TOPMOST);
+        assert_eq!(z_band(false), HWND_NOTOPMOST);
+        settings.always_on_top = !settings.always_on_top;
+        assert!(!settings.always_on_top);
+        settings.always_on_top = !settings.always_on_top;
+        assert!(settings.always_on_top);
+    }
+
+    #[test]
+    fn test_accessible_title_for_settings() {
+        use crate::clipboard::ClipboardItem;
+        let clock =
+            crate::clock::ClockDateState::from_pure_components(2026, 10, 6, 2, 0, 47, 0, 0, false);
+        let mut history = ClipboardHistory::default();
+        history.add(ClipboardItem::Text("secret".into()));
+        let media = MediaContent {
+            title: "Song".into(),
+            ..MediaContent::test_default()
+        };
+        for space in NottSpace::ALL {
+            let t = |on| {
+                accessible_title(
+                    NotchState::Expanded,
+                    &clock,
+                    Some(&media),
+                    space,
+                    &history,
+                    Some(on),
+                )
+            };
+            assert!(
+                t(true)
+                    .starts_with("Settings, Always on top enabled - Always on top switch, on - ")
+            );
+            assert!(
+                t(false)
+                    .starts_with("Settings, Always on top disabled - Always on top switch, off - ")
+            );
+            assert!(
+                t(true).contains(&format!("{} space selected", space.label())),
+                "space kept"
+            );
+            assert!(!t(true).contains("secret") && !t(true).contains("Song"));
+        }
+        // Collapsed: just the time, as before
+        assert_eq!(
+            accessible_title(
+                NotchState::Collapsed,
+                &clock,
+                None,
+                NottSpace::Home,
+                &history,
+                Some(true)
+            ),
+            clock.formatted_time
+        );
     }
 
     #[test]
