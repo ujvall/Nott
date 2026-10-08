@@ -18,10 +18,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SPI_GETCLIENTAREAANIMATION, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
     ShowWindow, SystemParametersInfoW, TranslateMessage, UnregisterClassW, WM_APP,
-    WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCDESTROY, WM_NCHITTEST, WM_POWERBROADCAST,
-    WM_TIMECHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    WM_CAPTURECHANGED, WM_CLIPBOARDUPDATE, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCDESTROY, WM_NCHITTEST,
+    WM_POWERBROADCAST, WM_TIMECHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{Error, Result};
 
@@ -33,18 +33,28 @@ unsafe extern "system" {
     fn timeEndPeriod(uPeriod: u32) -> u32;
 }
 
+use crate::clipboard::{self, ClipboardHistory, ClipboardItem};
 use crate::clock::ClockEngine;
 use crate::config::{
-    ANIMATION_FRAME_INTERVAL_MS, ANIMATION_TIMER_ID, AnimationState, CLOCK_TIMER_ID,
-    MEDIA_FEEDBACK_FRAME_MS, MEDIA_FEEDBACK_TIMER_ID, MEDIA_LIVE_FRAME_MS, MEDIA_LIVE_TIMER_ID,
-    NotchDimensions, NotchState, WINDOW_CLASS_NAME, WINDOW_TITLE, calculate_notch_x,
+    ANIMATION_FRAME_INTERVAL_MS, ANIMATION_TIMER_ID, AnimationState, CLIPBOARD_SETTLE_MS,
+    CLIPBOARD_TIMER_ID, CLOCK_TIMER_ID, MEDIA_FEEDBACK_FRAME_MS, MEDIA_FEEDBACK_TIMER_ID,
+    MEDIA_LIVE_FRAME_MS, MEDIA_LIVE_TIMER_ID, NotchDimensions, NotchState, WINDOW_CLASS_NAME,
+    WINDOW_TITLE, calculate_notch_x,
 };
-use crate::layout::{MediaLayout, resolve_media_layout};
+use crate::dragdrop::{self, DragEvent, DragSession, DropTarget};
+use crate::layout::{ClipboardHit, MediaLayout, resolve_clipboard_layout};
+use crate::layout::{
+    blended_selector, expanded_size_dip, resolve_media_layout_in, space_dimensions,
+};
 use crate::media::{
     MediaContent, MediaControl, MediaEngine, WM_APP_MEDIA_PLAYBACK_CHANGED,
     WM_APP_MEDIA_PROPERTIES_CHANGED, WM_APP_MEDIA_SESSION_CHANGED, is_media_message,
 };
-use crate::renderer::Renderer;
+use crate::renderer::{DROP_PAGE_SPACE, Renderer};
+use crate::space::{NottSpace, Scene};
+use windows::Win32::System::Ole::{
+    OleInitialize, OleUninitialize, RegisterDragDrop, RevokeDragDrop,
+};
 
 /// Owns the process's 1 ms timer-resolution request (`timeBeginPeriod`), held
 /// only while the notch animation runs. Requests never stack (reversing an
@@ -100,10 +110,18 @@ struct WindowState {
     media: MediaEngine,
     /// Display model derived from `media` (None = no session).
     media_content: Option<MediaContent>,
+    /// Active space (every space renders the existing UI for now). Starts in
+    /// Home, never persisted; media updates never touch it. Changed only through
+    /// `select_space`, which keeps the renderer's selector in sync.
+    space: NottSpace,
     /// Last tick of the control feedback timer (Some only while it runs).
     feedback_tick: Option<std::time::Instant>,
     /// Last tick of the playback live timer (Some only while it runs).
     live_tick: Option<std::time::Instant>,
+    /// Clipboard history (in memory only; filled on `WM_CLIPBOARDUPDATE`).
+    clipboard: ClipboardHistory,
+    /// Active OLE drag over the notch (image-file drops into the history).
+    drag: DragSession,
 }
 
 impl WindowState {
@@ -112,10 +130,15 @@ impl WindowState {
         if self.state != NotchState::Expanded
             || self.animation.is_some()
             || self.media_content.is_none()
+            || self.space == NottSpace::Clipboard
         {
             return None;
         }
-        resolve_media_layout(&self.dimensions, self.media_content.as_ref()?.shape())
+        resolve_media_layout_in(
+            &self.dimensions,
+            self.media_content.as_ref()?.shape(),
+            self.space,
+        )
     }
 
     /// Redraws the settled notch (no-op while the notch animation owns frames).
@@ -152,12 +175,24 @@ impl WindowState {
     /// the visualizer needs frames. It stops itself once playback is no longer
     /// playing and the bars have faded out, so paused/no media costs nothing.
     fn kick_live(&mut self, hwnd: HWND) {
+        if !self.live_visible() {
+            // Nothing live on screen (Home expanded): no frames; settle the fade
+            self.renderer.visualizer().settle();
+            return;
+        }
         if self.live_tick.is_none() && self.renderer.visualizer().is_active() {
             self.live_tick = Some(std::time::Instant::now());
             unsafe {
                 let _ = SetTimer(Some(hwnd), MEDIA_LIVE_TIMER_ID, MEDIA_LIVE_FRAME_MS, None);
             }
         }
+    }
+
+    /// Whether a visualizer or scrubber is on screen: the collapsed notch's
+    /// visualizer, the Music space, or a notch animation (its frames show both
+    /// ends). The settled Home expanded notch shows neither.
+    fn live_visible(&self) -> bool {
+        self.animation.is_some() || self.state == NotchState::Collapsed || self.space.is_music()
     }
 
     /// Drops all control feedback immediately (e.g. when the notch toggles).
@@ -167,6 +202,283 @@ impl WindowState {
             unsafe {
                 let _ = KillTimer(Some(hwnd), MEDIA_FEEDBACK_TIMER_ID);
             }
+        }
+    }
+
+    /// Space capsule under a client-area point: on the expanded notch, settled
+    /// or mid width transition (the selector is drawn from the same interpolated
+    /// dimensions, so what is clicked is what is seen). Not during expand/collapse.
+    fn space_at(&self, lparam: LPARAM) -> Option<NottSpace> {
+        let width_only = self
+            .animation
+            .as_ref()
+            .is_none_or(|a| a.is_space_transition());
+        if self.state != NotchState::Expanded || !width_only {
+            return None;
+        }
+        let x = (lparam.0 & 0xFFFF) as i16 as f32;
+        let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+        // The pills where they are drawn this frame (gliding mid transition)
+        let (from, to, mix) = match &self.animation {
+            Some(anim) => {
+                let t = anim.transition();
+                (t.from, t.to, t.mix)
+            }
+            None => (self.scene(), self.scene(), 1.0),
+        };
+        let space = |s: Scene| match s {
+            Scene::Space(space) => space,
+            Scene::Drop => self.space,
+        };
+        blended_selector(&self.dimensions, space(from), space(to), mix)?
+            .0
+            .space_at(x, y)
+    }
+
+    /// Selects a space (the selector's only route to `NottSpace::switch_to`); a
+    /// no-op when already active. On the settled expanded notch the width
+    /// transitions to the space's width on the existing animation timer; while
+    /// collapsed (or mid expand/collapse) the space is only stored, and the next
+    /// expansion opens straight into its width.
+    fn select_space(&mut self, hwnd: HWND, space: NottSpace) {
+        let before = self.scene();
+        if self.space.switch_to(space) {
+            self.renderer.set_space(space);
+            // Controls move with the layout: drop stale hover/press
+            self.reset_feedback(hwnd);
+            self.resize_to_target(hwnd, before);
+            notify_accessibility_state_changed(
+                hwnd,
+                self.state,
+                self.clock.state(),
+                self.media_content.as_ref(),
+                self.space,
+                &self.clipboard,
+            );
+        }
+    }
+
+    /// The space whose expanded size the notch takes: the drop page always uses
+    /// the Clipboard notch's (one universal size, whichever space is active).
+    fn size_space(&self) -> NottSpace {
+        if self.renderer.drop_page() {
+            DROP_PAGE_SPACE
+        } else {
+            self.space
+        }
+    }
+
+    /// What the expanded notch shows: the drop page during an image drag,
+    /// otherwise the active space.
+    fn scene(&self) -> Scene {
+        if self.renderer.drop_page() {
+            Scene::Drop
+        } else {
+            Scene::Space(self.space)
+        }
+    }
+
+    /// After the space or drop page changed (from showing `before`): the notch
+    /// moves to its new size and content. A running animation (any kind,
+    /// including an expand still opening) is retargeted in place, keeping its
+    /// position and velocity; the settled expanded notch starts a space
+    /// transition; collapsed, the change is only stored.
+    fn resize_to_target(&mut self, hwnd: HWND, before: Scene) {
+        let to = expanded_size_dip(self.size_space(), self.dimensions.dpi);
+        let scene = self.scene();
+        if let Some(anim) = &mut self.animation {
+            if anim.target_state == NotchState::Expanded {
+                anim.retarget(NotchState::Expanded, to);
+            }
+            anim.retarget_scene(scene);
+            return;
+        }
+        if self.state != NotchState::Expanded {
+            self.redraw(hwnd);
+            return;
+        }
+        let from = (
+            self.dimensions.width as f32 / self.dimensions.scale,
+            self.dimensions.height as f32 / self.dimensions.scale,
+        );
+        if from == to && before == scene {
+            self.redraw(hwnd);
+            return;
+        }
+        if !is_client_animation_enabled() {
+            let dims =
+                space_dimensions(NotchState::Expanded, self.dimensions.dpi, self.size_space());
+            let screen_width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+            self.dimensions = dims;
+            self.pos_x = calculate_notch_x(screen_width, dims.width);
+            self.redraw(hwnd);
+            unsafe {
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOPMOST),
+                    self.pos_x,
+                    self.pos_y,
+                    dims.width,
+                    dims.height,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+            }
+            return;
+        }
+        let mut anim = AnimationState::space(from, to, before, scene);
+        anim.scale = self.dimensions.scale;
+        self.animation = Some(anim);
+        self.last_frame_time = Some(std::time::Instant::now());
+        self.high_res_timer.set(true);
+        unsafe {
+            SetTimer(
+                Some(hwnd),
+                ANIMATION_TIMER_ID,
+                ANIMATION_FRAME_INTERVAL_MS,
+                None,
+            );
+        }
+    }
+
+    /// Places history entry `index` back on the system clipboard and makes it
+    /// the newest entry. The update Windows then sends is Nott's own (owner
+    /// check), so no duplicate is stored. Failures leave everything unchanged.
+    fn restore_clipboard(
+        &mut self,
+        hwnd: HWND,
+        index: usize,
+    ) -> std::result::Result<(), clipboard::ClipboardError> {
+        let item = self
+            .clipboard
+            .get(index)
+            .cloned()
+            .ok_or(clipboard::ClipboardError::Invalid)?;
+        clipboard::write(hwnd, &item)?;
+        self.clipboard.promote(index);
+        Ok(())
+    }
+
+    /// Expanded, or animating toward expanded.
+    fn expanded_or_expanding(&self) -> bool {
+        self.animation
+            .as_ref()
+            .map_or(self.state == NotchState::Expanded, |a| {
+                a.target_state == NotchState::Expanded
+            })
+    }
+
+    /// Whether a screen point is in the drop zone: the drop page's own settled
+    /// silhouette (centred at the top of the screen). Fixed whatever size the
+    /// notch has right now, so the page opening/resizing under the pointer can
+    /// never flip the answer (no flicker at the edges).
+    fn screen_point_in_drop_zone(&self, at: POINT) -> bool {
+        let zone = space_dimensions(NotchState::Expanded, self.dimensions.dpi, DROP_PAGE_SPACE);
+        let left = calculate_notch_x(unsafe { GetSystemMetrics(SM_CXSCREEN) }, zone.width);
+        zone.contains_point((at.x - left) as f32, (at.y - self.pos_y) as f32)
+    }
+
+    /// One OLE drag event (UI thread). Supported image files over the notch are
+    /// accepted; the first such moment expands a collapsed notch through the
+    /// existing animation, and leave/cancel/drop collapse it again only if the
+    /// drag opened it. Files are decoded only on drop, into the existing
+    /// clipboard history; the newest is then placed on the system clipboard
+    /// through the restore path (its own update is skipped by the owner check).
+    fn on_drag(&mut self, hwnd: HWND, event: DragEvent) -> bool {
+        let over = |state: &mut Self, at: POINT| {
+            let in_notch = state.screen_point_in_drop_zone(at);
+            let expanded = state.expanded_or_expanding();
+            let before = state.scene();
+            let action = state.drag.over(in_notch, expanded);
+            // Drop page while an accepted image is over the notch, at its own
+            // universal size (an expansion it starts opens straight at it)
+            if state.renderer.set_drop_page(action.accept) && !action.expand {
+                state.resize_to_target(hwnd, before);
+            }
+            if action.expand {
+                state.reset_feedback(hwnd);
+                let _ = start_or_reverse_animation(hwnd, state);
+            }
+            action.accept
+        };
+        let end = |state: &mut Self| {
+            let collapse = state.drag.end() && state.expanded_or_expanding();
+            let before = state.scene();
+            let changed = state.renderer.set_drop_page(false);
+            if collapse {
+                state.reset_feedback(hwnd);
+                let _ = start_or_reverse_animation(hwnd, state);
+            } else if changed {
+                // Back to the active space's own size and content
+                state.resize_to_target(hwnd, before);
+            }
+        };
+        match event {
+            DragEvent::Enter { images, at } => {
+                self.drag.enter(images);
+                over(self, at)
+            }
+            DragEvent::Over { at } => over(self, at),
+            DragEvent::Leave => {
+                end(self);
+                false
+            }
+            DragEvent::Drop { images, at } => {
+                let accept = over(self, at) && !images.is_empty();
+                let mut stored = false;
+                if accept {
+                    // Unsupported / unreadable / malformed / too large: skipped
+                    let decoded: Vec<_> = images
+                        .iter()
+                        .filter_map(|p| dragdrop::decode_image_file(p).ok())
+                        .collect();
+                    if dragdrop::ingest(&mut self.clipboard, decoded) {
+                        stored = true;
+                        // Clipboard busy: the history keeps it; no retry
+                        let _ = self.restore_clipboard(hwnd, 0);
+                        self.clipboard_changed(hwnd);
+                    }
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "[dragdrop] {} image file(s) dropped, stored: {}, {} entries",
+                        images.len(),
+                        stored,
+                        self.clipboard.len()
+                    );
+                }
+                end(self);
+                stored
+            }
+        }
+    }
+
+    /// Clipboard row or Clear under a client-area point (settled Clipboard
+    /// space only; everything else there is notch background).
+    fn clipboard_hit(&self, lparam: LPARAM) -> Option<ClipboardHit> {
+        if self.state != NotchState::Expanded
+            || self.animation.is_some()
+            || self.space != NottSpace::Clipboard
+        {
+            return None;
+        }
+        let x = (lparam.0 & 0xFFFF) as i16 as f32;
+        let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+        resolve_clipboard_layout(&self.dimensions)?.hit(x, y, self.clipboard.len())
+    }
+
+    /// After any history change: rebuild the Clipboard rows, and if that space
+    /// is on screen, redraw it and refresh its accessible title.
+    fn clipboard_changed(&mut self, hwnd: HWND) {
+        self.renderer.set_clipboard(&self.clipboard);
+        if self.state == NotchState::Expanded && self.space == NottSpace::Clipboard {
+            self.redraw(hwnd);
+            notify_accessibility_state_changed(
+                hwnd,
+                self.state,
+                self.clock.state(),
+                self.media_content.as_ref(),
+                self.space,
+                &self.clipboard,
+            );
         }
     }
 
@@ -197,26 +509,74 @@ fn is_client_animation_enabled() -> bool {
     }
 }
 
+/// Accessible description of the space selector, e.g. "Home space selected
+/// (spaces: Home, Music, Clipboard)".
+fn accessible_space(space: NottSpace) -> String {
+    let all: Vec<&str> = NottSpace::ALL.iter().map(|s| s.label()).collect();
+    format!(
+        "{} space selected (spaces: {})",
+        space.label(),
+        all.join(", ")
+    )
+}
+
+/// Accessible title including the Clipboard space: there it describes the
+/// history (count, newest entry's kind, the Clear control), never contents.
+fn accessible_title(
+    state: NotchState,
+    clock: &crate::clock::ClockDateState,
+    media: Option<&MediaContent>,
+    space: NottSpace,
+    clipboard: &ClipboardHistory,
+) -> String {
+    if state != NotchState::Expanded || space != NottSpace::Clipboard {
+        return accessible_title_for_clock(state, clock, media, space);
+    }
+    let history = match (clipboard.len(), clipboard.get(0)) {
+        (n, Some(newest)) => format!(
+            "Clipboard history, {n} {}, newest is {}, Copy and Delete buttons on each item, Clear history button",
+            if n == 1 { "item" } else { "items" },
+            match newest {
+                ClipboardItem::Text(_) => "text",
+                ClipboardItem::Image(_) => "an image",
+            }
+        ),
+        _ => "Clipboard history, empty".to_string(),
+    };
+    format!(
+        "{history} - {} - {} - {}",
+        clock.formatted_time,
+        clock.formatted_date,
+        accessible_space(space)
+    )
+}
+
 /// Returns the user-facing accessible title for a given notch state and clock state.
-/// When expanded with media, the displayed track (and the control actions) lead the title.
+/// When expanded with media, the displayed track (and the control actions) lead the
+/// title; the expanded notch ends with the active space and the selectable spaces.
 fn accessible_title_for_clock(
     state: NotchState,
     clock: &crate::clock::ClockDateState,
     media: Option<&MediaContent>,
+    space: NottSpace,
 ) -> String {
     match (state, media) {
         (NotchState::Collapsed, _) => clock.formatted_time.clone(),
-        (NotchState::Expanded, None) => {
-            format!("{} - {}", clock.formatted_time, clock.formatted_date)
-        }
+        (NotchState::Expanded, None) => format!(
+            "{} - {} - {}",
+            clock.formatted_time,
+            clock.formatted_date,
+            accessible_space(space)
+        ),
         (NotchState::Expanded, Some(m)) => format!(
-            "{} - {}, {}, {} - {} - {}",
+            "{} - {}, {}, {} - {} - {} - {}",
             m.accessible_text(),
             MediaControl::Previous.accessible_name(m.icon),
             MediaControl::PlayPause.accessible_name(m.icon),
             MediaControl::Next.accessible_name(m.icon),
             clock.formatted_time,
-            clock.formatted_date
+            clock.formatted_date,
+            accessible_space(space)
         ),
     }
 }
@@ -228,8 +588,10 @@ fn notify_accessibility_state_changed(
     new_state: NotchState,
     clock: &crate::clock::ClockDateState,
     media: Option<&MediaContent>,
+    space: NottSpace,
+    clipboard: &ClipboardHistory,
 ) {
-    let title = accessible_title_for_clock(new_state, clock, media);
+    let title = accessible_title(new_state, clock, media, space, clipboard);
     let wide_title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         let _ = SetWindowTextW(hwnd, windows::core::PCWSTR(wide_title.as_ptr()));
@@ -244,8 +606,10 @@ fn notify_accessibility_clock_changed(
     state: NotchState,
     clock: &crate::clock::ClockDateState,
     media: Option<&MediaContent>,
+    space: NottSpace,
+    clipboard: &ClipboardHistory,
 ) {
-    let title = accessible_title_for_clock(state, clock, media);
+    let title = accessible_title(state, clock, media, space, clipboard);
     let wide_title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         let _ = SetWindowTextW(hwnd, windows::core::PCWSTR(wide_title.as_ptr()));
@@ -275,9 +639,10 @@ fn start_or_reverse_animation(hwnd: HWND, state: &mut WindowState) -> Result<()>
         }
         state.high_res_timer.set(false);
         state.animation = None;
+        state.renderer.set_transition(None);
         state.last_frame_time = None;
         state.state = target_state;
-        let new_dims = NotchDimensions::from_state_and_dpi(target_state, state.dimensions.dpi);
+        let new_dims = space_dimensions(target_state, state.dimensions.dpi, state.size_space());
         state.dimensions = new_dims;
 
         let screen_width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
@@ -337,14 +702,28 @@ fn start_or_reverse_animation(hwnd: HWND, state: &mut WindowState) -> Result<()>
             target_state,
             state.clock.state(),
             state.media_content.as_ref(),
+            state.space,
+            &state.clipboard,
         );
         return Ok(());
     }
 
-    let new_anim = if let Some(current_anim) = &state.animation {
-        current_anim.reverse_from_current()
+    // The expanded end is the active space's (or drop page's) size. A running
+    // animation is retargeted: it continues from its position and velocity.
+    let size = expanded_size_dip(state.size_space(), state.dimensions.dpi);
+    let scene = state.scene();
+    let new_anim = if let Some(mut anim) = state.animation {
+        anim.retarget(target_state, size);
+        anim.retarget_scene(scene);
+        anim
     } else {
-        AnimationState::new(state.state, target_state)
+        let from = (
+            state.dimensions.width as f32 / state.dimensions.scale,
+            state.dimensions.height as f32 / state.dimensions.scale,
+        );
+        let mut anim = AnimationState::start(state.state, from, target_state, size, scene);
+        anim.scale = state.dimensions.scale;
+        anim
     };
 
     state.animation = Some(new_anim);
@@ -369,7 +748,7 @@ fn start_or_reverse_animation(hwnd: HWND, state: &mut WindowState) -> Result<()>
 #[allow(dead_code)]
 fn set_notch_state(hwnd: HWND, state: &mut WindowState, new_state: NotchState) -> Result<()> {
     let dpi = state.dimensions.dpi;
-    let new_dims = NotchDimensions::from_state_and_dpi(new_state, dpi);
+    let new_dims = space_dimensions(new_state, dpi, state.size_space());
     let screen_width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
     let new_x = calculate_notch_x(screen_width, new_dims.width);
     let new_y = 0;
@@ -428,6 +807,8 @@ fn set_notch_state(hwnd: HWND, state: &mut WindowState, new_state: NotchState) -
         new_state,
         state.clock.state(),
         state.media_content.as_ref(),
+        state.space,
+        &state.clipboard,
     );
     Ok(())
 }
@@ -626,9 +1007,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
                     let now = std::time::Instant::now();
                     let delta_ms = if let Some(last) = state.last_frame_time {
-                        now.duration_since(last).as_millis().max(1) as u64
+                        now.duration_since(last).as_secs_f32() * 1000.0
                     } else {
-                        ANIMATION_FRAME_INTERVAL_MS as u64
+                        ANIMATION_FRAME_INTERVAL_MS as f32
                     };
                     state.last_frame_time = Some(now);
 
@@ -639,6 +1020,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     };
 
                     let current_dims = if let Some(anim) = &state.animation {
+                        state.renderer.set_transition(Some(anim.transition()));
                         anim.current_dimensions(state.dimensions.dpi)
                     } else {
                         state.dimensions
@@ -664,15 +1046,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         // Animation complete: snap cleanly to target state and deactivate timer
                         if let Some(anim) = state.animation.take() {
                             state.state = anim.target_state;
-                            state.dimensions = NotchDimensions::from_state_and_dpi(
+                            state.dimensions = space_dimensions(
                                 anim.target_state,
                                 state.dimensions.dpi,
+                                state.size_space(),
+                            );
+                            // The last frame was already at the target; draw the
+                            // settled state once (exact pixels, no transition)
+                            state.renderer.set_transition(None);
+                            let _ = state.renderer.render(
+                                hwnd,
+                                new_x,
+                                new_y,
+                                &state.dimensions,
+                                state.hovered,
+                                state.clock.state(),
                             );
                             notify_accessibility_state_changed(
                                 hwnd,
                                 state.state,
                                 state.clock.state(),
                                 state.media_content.as_ref(),
+                                state.space,
+                                &state.clipboard,
                             );
                         }
                         state.last_frame_time = None;
@@ -727,6 +1123,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             state.hovered,
                             state.clock.state(),
                         );
+                        // Settled somewhere showing a visualizer/scrubber again
+                        state.kick_live(hwnd);
                     }
                 });
             } else if wparam.0 == MEDIA_FEEDBACK_TIMER_ID {
@@ -757,13 +1155,42 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             now.duration_since(t).as_secs_f32() * 1000.0
                         });
                     let active = state.renderer.visualizer().step(dt);
+                    let visible = state.live_visible();
                     // During a notch animation its own frames show the motion
-                    state.redraw(hwnd);
-                    if !active {
+                    if visible {
+                        state.redraw(hwnd);
+                    } else {
+                        state.renderer.visualizer().settle();
+                    }
+                    if !active || !visible {
                         state.live_tick = None;
                         unsafe {
                             let _ = KillTimer(Some(hwnd), MEDIA_LIVE_TIMER_ID);
                         }
+                    }
+                });
+            } else if wparam.0 == CLIPBOARD_TIMER_ID {
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), CLIPBOARD_TIMER_ID);
+                }
+                with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                    if clipboard::owned_by(hwnd) {
+                        return;
+                    }
+                    // Unavailable / unsupported / too large: skipped, never retried
+                    if let Ok(item) = clipboard::read(hwnd) {
+                        let _outcome = state.clipboard.add(item);
+                        if _outcome == clipboard::AddOutcome::Added {
+                            state.clipboard_changed(hwnd);
+                        }
+                        // Kinds and counts only, never contents
+                        #[cfg(debug_assertions)]
+                        eprintln!(
+                            "[clipboard] {:?}, {} entries, {} image bytes",
+                            _outcome,
+                            state.clipboard.len(),
+                            state.clipboard.image_bytes()
+                        );
                     }
                 });
             } else if wparam.0 == CLOCK_TIMER_ID {
@@ -775,6 +1202,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             state.state,
                             state.clock.state(),
                             state.media_content.as_ref(),
+                            state.space,
+                            &state.clipboard,
                         );
                         if state.animation.is_none() {
                             let _ = state.renderer.render(
@@ -825,13 +1254,35 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if state.renderer.set_hovered_control(control) {
                     state.kick_feedback(hwnd);
                 }
+                // Clipboard: the hovered row shows its buttons; a hovered button grows
+                let hit = state.clipboard_hit(lparam);
+                let row = hit.and_then(|h| match h {
+                    ClipboardHit::Row(i) | ClipboardHit::Copy(i) | ClipboardHit::Remove(i) => {
+                        Some(i)
+                    }
+                    ClipboardHit::Clear => None,
+                });
+                let changed = {
+                    let mut feedback = state.renderer.feedback();
+                    let row_changed = feedback.set_clip_row(row);
+                    feedback.set_clip_hovered(hit.filter(|h| h.is_button())) || row_changed
+                };
+                if changed {
+                    state.kick_feedback(hwnd);
+                }
             });
             LRESULT(0)
         }
 
         WM_MOUSELEAVE => {
             with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
-                if state.renderer.set_hovered_control(None) {
+                let left_clip = {
+                    let mut feedback = state.renderer.feedback();
+                    let released = feedback.release_clip();
+                    let row_changed = feedback.set_clip_row(None);
+                    feedback.set_clip_hovered(None) || released || row_changed
+                };
+                if state.renderer.set_hovered_control(None) || left_clip {
                     state.kick_feedback(hwnd);
                 }
                 if state.hovered {
@@ -861,6 +1312,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                     // Press compresses smoothly on the shared feedback timer
                     state.kick_feedback(hwnd);
+                } else if let Some(button) = state.clipboard_hit(lparam).filter(|h| h.is_button()) {
+                    // Clipboard icon button: grows a little more while pressed
+                    state.renderer.feedback().press_clip(button);
+                    state.kick_feedback(hwnd);
                 }
             });
             LRESULT(0)
@@ -868,6 +1323,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
         WM_LBUTTONUP => {
             with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                // A pressed clipboard button eases back (its action runs below)
+                if state.renderer.feedback().release_clip() {
+                    state.kick_feedback(hwnd);
+                }
                 let pressed = state.renderer.feedback().release();
                 if let Some(pressed) = pressed {
                     unsafe {
@@ -883,6 +1342,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     // Transport control: send to the current session; never toggles the notch.
                     // Resulting playback/metadata state arrives through media events.
                     state.media.send_command(control);
+                } else if let Some(hit) = state.clipboard_hit(lparam) {
+                    // Clipboard row: back onto the system clipboard and to the
+                    // front (no duplicate). Clear: forget the in-memory history
+                    // only. Neither toggles the notch or leaves the space.
+                    match hit {
+                        ClipboardHit::Row(index) | ClipboardHit::Copy(index) => {
+                            // Clipboard busy: nothing changes; no retry
+                            let _ = state.restore_clipboard(hwnd, index);
+                        }
+                        ClipboardHit::Remove(index) => {
+                            state.clipboard.remove(index);
+                        }
+                        ClipboardHit::Clear => state.clipboard.clear(),
+                    }
+                    state.clipboard_changed(hwnd);
+                } else if let Some(space) = state.space_at(lparam) {
+                    // Space capsule: switches spaces; never toggles the notch
+                    state.select_space(hwnd, space);
                 } else {
                     state.reset_feedback(hwnd);
                     let _ = start_or_reverse_animation(hwnd, state);
@@ -918,7 +1395,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     } else {
                         GetDpiForWindow(hwnd)
                     };
-                    let new_dims = NotchDimensions::from_state_and_dpi(state.state, new_dpi);
+                    let new_dims = space_dimensions(state.state, new_dpi, state.size_space());
 
                     let screen_width = GetSystemMetrics(SM_CXSCREEN);
                     let new_x = calculate_notch_x(screen_width, new_dims.width);
@@ -959,7 +1436,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 unsafe {
                     let dpi = GetDpiForWindow(hwnd);
                     let dpi = if dpi > 0 { dpi } else { GetDpiForSystem() };
-                    let new_dims = NotchDimensions::from_state_and_dpi(state.state, dpi);
+                    let new_dims = space_dimensions(state.state, dpi, state.size_space());
 
                     let screen_width = GetSystemMetrics(SM_CXSCREEN);
                     let new_x = calculate_notch_x(screen_width, new_dims.width);
@@ -1004,6 +1481,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         state.state,
                         state.clock.state(),
                         state.media_content.as_ref(),
+                        state.space,
+                        &state.clipboard,
                     );
                     if state.animation.is_none() {
                         let _ = state.renderer.render(
@@ -1035,6 +1514,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             state.state,
                             state.clock.state(),
                             state.media_content.as_ref(),
+                            state.space,
+                            &state.clipboard,
                         );
                         if state.animation.is_none() {
                             let _ = state.renderer.render(
@@ -1104,6 +1585,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 state.state,
                                 state.clock.state(),
                                 state.media_content.as_ref(),
+                                state.space,
+                                &state.clipboard,
                             );
                         }
                     }
@@ -1129,13 +1612,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
 
+        WM_CLIPBOARDUPDATE => {
+            // Nott's own restore: the history already holds (and fronts) it.
+            // Otherwise read once the copying app has settled (one-shot timer;
+            // re-arming coalesces a burst of updates into a single read).
+            if !clipboard::owned_by(hwnd) {
+                unsafe {
+                    let _ = SetTimer(Some(hwnd), CLIPBOARD_TIMER_ID, CLIPBOARD_SETTLE_MS, None);
+                }
+            }
+            LRESULT(0)
+        }
+
         WM_DESTROY => {
             unsafe {
                 let _ = KillTimer(Some(hwnd), ANIMATION_TIMER_ID);
                 let _ = KillTimer(Some(hwnd), CLOCK_TIMER_ID);
                 let _ = KillTimer(Some(hwnd), MEDIA_FEEDBACK_TIMER_ID);
                 let _ = KillTimer(Some(hwnd), MEDIA_LIVE_TIMER_ID);
+                let _ = KillTimer(Some(hwnd), CLIPBOARD_TIMER_ID);
                 PostQuitMessage(0);
+            }
+            clipboard::stop_listening(hwnd);
+            // Releases OLE's reference to the drop target (no-op if never registered)
+            unsafe {
+                let _ = RevokeDragDrop(hwnd);
             }
             // Release a resolution request still held by an in-flight animation
             // (if the state is busy, HighResTimer's Drop releases it on free).
@@ -1147,7 +1648,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
 }
 
+/// OLE drop-target entry point (UI thread, from the message loop): routes the
+/// event through the same guarded `WindowState` access as the window procedure.
+/// Busy or missing state (re-entry, teardown) declines the drop.
+fn handle_drag(hwnd: HWND, event: DragEvent) -> bool {
+    match with_state(hwnd, |state| state.on_drag(hwnd, event)) {
+        Access::Ran(accept) => accept,
+        Access::Busy | Access::Missing => false,
+    }
+}
+
 pub fn run() -> Result<()> {
+    // OLE drag-and-drop needs this (UI) thread in a single-threaded apartment.
+    // Failure is non-fatal: Nott simply runs without being a drop target.
+    let ole = unsafe { OleInitialize(None) }.is_ok();
+    let result = run_window(ole);
+    if ole {
+        unsafe { OleUninitialize() };
+    }
+    result
+}
+
+fn run_window(ole: bool) -> Result<()> {
     unsafe {
         // Enable Per-Monitor V2 DPI awareness for sharp native rendering
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -1236,7 +1758,8 @@ pub fn run() -> Result<()> {
         let clock = ClockEngine::now();
         let rollover_ms = clock.ms_until_next_minute();
 
-        let initial_title = accessible_title_for_clock(dimensions.state, clock.state(), None);
+        let initial_title =
+            accessible_title_for_clock(dimensions.state, clock.state(), None, NottSpace::default());
         let title_wide: Vec<u16> = initial_title
             .encode_utf16()
             .chain(std::iter::once(0))
@@ -1256,8 +1779,11 @@ pub fn run() -> Result<()> {
             clock,
             media: MediaEngine::new(),
             media_content: None,
+            space: NottSpace::default(),
             feedback_tick: None,
             live_tick: None,
+            clipboard: ClipboardHistory::default(),
+            drag: DragSession::default(),
         });
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
 
@@ -1266,10 +1792,17 @@ pub fn run() -> Result<()> {
         // the window procedure (rendering can re-enter it synchronously).
         let initial = with_state(hwnd, |state| {
             let _ = state.media.initialize(hwnd);
+            // Event-driven clipboard history (no polling)
+            let _ = clipboard::start_listening(hwnd);
             state
                 .renderer
                 .render(hwnd, x, y, &state.dimensions, false, state.clock.state())
         });
+
+        // Image files dragged from Explorer (OLE owns the target until revoked)
+        if ole {
+            let _ = RegisterDragDrop(hwnd, &DropTarget::create(hwnd, handle_drag));
+        }
 
         // Schedule first minute rollover timer
         let _ = SetTimer(Some(hwnd), CLOCK_TIMER_ID, rollover_ms, None);
@@ -1438,6 +1971,7 @@ mod tests {
             crate::clock::ClockDateState::from_pure_components(2026, 10, 6, 2, 0, 47, 0, 0, false);
         let time = clock.formatted_time.clone();
         let date = clock.formatted_date.clone();
+        let home = NottSpace::Home;
         let playing = MediaContent {
             title: "Song".into(),
             subtitle: "Artist".into(),
@@ -1445,25 +1979,97 @@ mod tests {
             ..MediaContent::test_default()
         };
         assert_eq!(
-            accessible_title_for_clock(NotchState::Expanded, &clock, Some(&playing)),
-            format!("Song - Artist - Previous track, Pause, Next track - {time} - {date}")
+            accessible_title_for_clock(NotchState::Expanded, &clock, Some(&playing), home),
+            format!(
+                "Song - Artist - Previous track, Pause, Next track - {time} - {date} - Home space selected (spaces: Home, Music, Clipboard)"
+            )
         );
         let paused = MediaContent {
             icon: PlayPauseIcon::Play,
             ..playing.clone()
         };
         assert!(
-            accessible_title_for_clock(NotchState::Expanded, &clock, Some(&paused))
+            accessible_title_for_clock(NotchState::Expanded, &clock, Some(&paused), home)
                 .contains("Previous track, Play, Next track")
         );
-        // Collapsed and no-media expanded titles are unchanged
+        // Collapsed title is unchanged (no selector there)
+        for space in NottSpace::ALL {
+            assert_eq!(
+                accessible_title_for_clock(NotchState::Collapsed, &clock, Some(&playing), space),
+                time
+            );
+        }
         assert_eq!(
-            accessible_title_for_clock(NotchState::Collapsed, &clock, Some(&playing)),
-            time
+            accessible_title_for_clock(NotchState::Expanded, &clock, None, home),
+            format!("{time} - {date} - Home space selected (spaces: Home, Music, Clipboard)")
         );
+    }
+
+    #[test]
+    fn test_accessible_title_for_clipboard_space() {
+        use crate::clipboard::ClipboardItem;
+        let clock =
+            crate::clock::ClockDateState::from_pure_components(2026, 10, 6, 2, 0, 47, 0, 0, false);
+        let (time, date) = (clock.formatted_time.clone(), clock.formatted_date.clone());
+        let media = MediaContent {
+            title: "Song".into(),
+            ..MediaContent::test_default()
+        };
+        let mut history = ClipboardHistory::default();
+        let title = |h: &ClipboardHistory, state| {
+            accessible_title(state, &clock, Some(&media), NottSpace::Clipboard, h)
+        };
         assert_eq!(
-            accessible_title_for_clock(NotchState::Expanded, &clock, None),
-            format!("{time} - {date}")
+            title(&history, NotchState::Expanded),
+            format!(
+                "Clipboard history, empty - {time} - {date} - Clipboard space selected (spaces: Home, Music, Clipboard)"
+            )
+        );
+        history.add(ClipboardItem::Text("secret password".into()));
+        history.add(ClipboardItem::Image(
+            crate::media::Artwork::new(1, 1, vec![0, 0, 0, 255]).unwrap(),
+        ));
+        let t = title(&history, NotchState::Expanded);
+        assert!(t.starts_with(
+            "Clipboard history, 2 items, newest is an image, Copy and Delete buttons on each item, Clear history button - "
+        ));
+        assert!(
+            !t.contains("secret") && !t.contains("Song"),
+            "no contents, no media"
+        );
+        history.promote(1);
+        assert!(title(&history, NotchState::Expanded).contains("newest is text"));
+        // Collapsed and the other spaces are unchanged
+        assert_eq!(title(&history, NotchState::Collapsed), time);
+        for s in [NottSpace::Home, NottSpace::Music] {
+            assert_eq!(
+                accessible_title(NotchState::Expanded, &clock, Some(&media), s, &history),
+                accessible_title_for_clock(NotchState::Expanded, &clock, Some(&media), s)
+            );
+        }
+    }
+
+    #[test]
+    fn test_accessible_title_reflects_active_space() {
+        let clock =
+            crate::clock::ClockDateState::from_pure_components(2026, 10, 6, 2, 0, 47, 0, 0, false);
+        let media = MediaContent {
+            title: "Song".into(),
+            ..MediaContent::test_default()
+        };
+        let mut space = NottSpace::default();
+        let title = |s| accessible_title_for_clock(NotchState::Expanded, &clock, Some(&media), s);
+        assert!(title(space).ends_with("Home space selected (spaces: Home, Music, Clipboard)"));
+        space.switch_to(NottSpace::Music);
+        assert!(title(space).ends_with("Music space selected (spaces: Home, Music, Clipboard)"));
+        // The media part is identical in both spaces
+        let media_part = |t: String| t.split(" - Home space").next().unwrap().to_string();
+        assert_eq!(
+            media_part(title(NottSpace::Home)),
+            title(NottSpace::Music)
+                .split(" - Music space")
+                .next()
+                .unwrap()
         );
     }
 

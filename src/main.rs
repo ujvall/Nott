@@ -1,10 +1,13 @@
 #![windows_subsystem = "windows"]
 
+mod clipboard;
 mod clock;
 mod config;
+mod dragdrop;
 mod layout;
 mod media;
 mod renderer;
+mod space;
 mod window;
 
 fn main() {

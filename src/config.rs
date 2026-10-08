@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use crate::space::Scene;
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::core::{PCWSTR, w};
 
@@ -29,7 +30,7 @@ pub const BASE_TOP_TRANSITION_HEIGHT: f32 = BASE_COLLAPSED_TOP_TRANSITION_HEIGHT
 
 // Expanded reference dimensions (600 × 128 logical DIP window: 110 DIP notch + shadow margin horizontal pill, compact smooth shoulder, subtle dropshadow)
 pub const BASE_EXPANDED_WIDTH: f32 = 600.0;
-pub const BASE_EXPANDED_HEIGHT: f32 = 128.0;
+pub const BASE_EXPANDED_HEIGHT: f32 = 138.0;
 pub const BASE_EXPANDED_BOTTOM_CORNER_RADIUS: f32 = 18.0;
 
 /// Expanded bottom corners use a continuous-curvature ("squircle") profile: the
@@ -94,6 +95,9 @@ pub const BASE_EXPANDED_TOP_TRANSITION_HEIGHT: f32 = 14.0;
 pub const BASE_EXPANDED_SHADOW_MARGIN_X: f32 = 10.0;
 pub const BASE_EXPANDED_SHADOW_MARGIN_BOTTOM: f32 = 18.0;
 pub const BASE_EXPANDED_SHADOW_OPACITY: f32 = 0.28;
+/// Extra header band at the top of the expanded notch (both spaces) so the
+/// space selector has real breathing room above the content.
+pub const BASE_EXPANDED_HEADER_EXTRA: f32 = 10.0;
 
 // Stroke & separation tokens
 pub const BASE_BORDER_WIDTH: f32 = 1.0;
@@ -180,6 +184,17 @@ pub const MEDIA_PRESS_ICON_SCALE: f32 = 0.84;
 pub const MEDIA_TRACK_FADE_FLOOR: f32 = 0.35;
 /// ...over this duration (ease-out). Shares the control feedback timer.
 pub const MEDIA_TRACK_FADE_MS: f32 = 180.0;
+/// Clipboard history (in memory only): newest-first entries, total owned image
+/// memory, and the longest text kept (UTF-16 code units, ~512 KB).
+pub const CLIPBOARD_MAX_ENTRIES: usize = 20;
+pub const CLIPBOARD_MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+pub const CLIPBOARD_MAX_TEXT_UNITS: usize = 256 * 1024;
+/// One-shot settle delay before reading a clipboard change: the copying app
+/// finishes rendering/flushing its data first, and bursts coalesce into one
+/// read. The timer exists only between an update and its read.
+pub const CLIPBOARD_TIMER_ID: usize = 1005;
+pub const CLIPBOARD_SETTLE_MS: u32 = 150;
+
 pub const MEDIA_FEEDBACK_TIMER_ID: usize = 1003;
 pub const MEDIA_FEEDBACK_FRAME_MS: u32 = 16;
 /// Playback "live" timer (visualizer + scrubber): runs only while playing or
@@ -198,10 +213,84 @@ pub const VISUALIZER_FADE_MS: f32 = 220.0;
 /// Space between the title and the expanded visualizer.
 pub const BASE_MEDIA_VISUALIZER_GAP: f32 = 8.0;
 
+/// Space selector (Home / Music): capsules in the expanded notch's top band,
+/// above the media content, left-aligned with the cover.
+pub const BASE_SPACE_SELECTOR_TOP: f32 = 7.0;
+pub const BASE_SPACE_PILL_WIDTH: f32 = 34.0;
+pub const BASE_SPACE_PILL_HEIGHT: f32 = 22.0;
+/// Space icons (Flaticon UIcons solid-rounded house-blank / music-alt): glyph
+/// box (DIP); the glyphs fill their box edge to edge.
+pub const BASE_SPACE_ICON_SIZE: f32 = 12.0;
+pub const BASE_SPACE_PILL_GAP: f32 = 4.0;
+pub const BASE_SPACE_FONT_SIZE: f32 = 11.0;
+
+/// Music player column inset from both side walls (cover, visualizer, scrubber
+/// and the selector pills keep this breathing room from the notch edges).
+pub const BASE_MUSIC_SIDE_INSET: f32 = 16.0;
+/// Music player (DIP): a small cover with title/artist beside it, then a
+/// full-width scrubber row, then larger centred controls. The Music notch
+/// height is derived from these rows.
+pub const BASE_MUSIC_ARTWORK_SIZE: f32 = 40.0;
+pub const BASE_MUSIC_ARTWORK_RADIUS: f32 = 8.0;
+pub const BASE_MUSIC_ARTWORK_GAP: f32 = 12.0;
+pub const BASE_MUSIC_SCRUBBER_GAP: f32 = 6.0;
+pub const BASE_MUSIC_SCRUBBER_HEIGHT: f32 = 14.0;
+pub const BASE_MUSIC_CONTROLS_GAP: f32 = 4.0;
+/// Larger transport controls (same icons, scaled up): backdrop diameter, hit
+/// area, gap between hit areas, glyph sizes.
+pub const BASE_MUSIC_CONTROL_VISUAL_SIZE: f32 = 30.0;
+pub const BASE_MUSIC_CONTROL_WIDTH: f32 = 44.0;
+pub const BASE_MUSIC_CONTROL_HEIGHT: f32 = 34.0;
+pub const BASE_MUSIC_CONTROL_GAP: f32 = 16.0;
+pub const BASE_MUSIC_ICON_SIZE: f32 = 16.0;
+pub const BASE_MUSIC_PLAY_ICON_SIZE: f32 = 19.0;
+/// Below the controls' hit areas, before the notch's bottom edge.
+pub const BASE_MUSIC_BOTTOM_PAD: f32 = 6.0;
+
+/// Music space: scrubber track width the compact Music notch is sized around
+/// (the only Music-specific width input; everything else is existing layout).
+pub const BASE_MUSIC_TIMELINE_TRACK: f32 = 240.0;
+
+/// Clipboard space (DIP): its own window width and list rows. The count label
+/// and the Clear capsule share the selector band; the newest rows fill the
+/// content area (older entries stay in the history, reachable once newer ones
+/// are cleared or restored past them).
+pub const BASE_CLIPBOARD_WIDTH: f32 = 440.0;
+pub const BASE_CLIPBOARD_SIDE_INSET: f32 = 16.0;
+pub const CLIPBOARD_VISIBLE_ROWS: usize = 5;
+pub const BASE_CLIPBOARD_ROW_HEIGHT: f32 = 26.0;
+pub const BASE_CLIPBOARD_ROW_GAP: f32 = 2.0;
+pub const BASE_CLIPBOARD_ROW_RADIUS: f32 = 8.0;
+/// Text inset inside a row, and the thumbnail's inset from the row edges.
+pub const BASE_CLIPBOARD_ROW_PAD: f32 = 10.0;
+pub const BASE_CLIPBOARD_THUMB_INSET: f32 = 3.0;
+pub const BASE_CLIPBOARD_THUMB_RADIUS: f32 = 5.0;
+pub const BASE_CLIPBOARD_BOTTOM_PAD: f32 = 12.0;
+/// Copy / trash glyphs after each row's outline, and the header's clear X
+/// (each in a row- or band-height square).
+pub const BASE_CLIPBOARD_ACTION_ICON_SIZE: f32 = 13.0;
+pub const BASE_CLIPBOARD_CLEAR_ICON_SIZE: f32 = 11.0;
+/// Row outline stroke (DIP).
+pub const BASE_CLIPBOARD_ROW_OUTLINE: f32 = 1.0;
+/// Icon button growth at full hover / full press (fractions, additive).
+pub const CLIPBOARD_BUTTON_HOVER_GROW: f32 = 0.16;
+pub const CLIPBOARD_BUTTON_PRESS_GROW: f32 = 0.12;
+/// Longest text preview kept for a row (characters; DirectWrite ellipsizes).
+pub const CLIPBOARD_PREVIEW_CHARS: usize = 160;
+
+/// Drop page (an image dragged over the notch, DIP): a rounded dashed outline
+/// inset from the notch body, with the inbox glyph centred inside.
+pub const BASE_DROP_OUTLINE_INSET: f32 = 8.0;
+pub const BASE_DROP_OUTLINE_RADIUS: f32 = 14.0;
+pub const BASE_DROP_OUTLINE_WIDTH: f32 = 1.5;
+/// Dash and gap lengths in stroke widths (round caps add one width to each dash).
+pub const DROP_OUTLINE_DASHES: [f32; 2] = [2.0, 3.5];
+pub const BASE_DROP_ICON_SIZE: f32 = 34.0;
+
 /// Inline scrubber in the controls row: `[controls]  0:49 ━━━●── -2:08`.
 pub const BASE_MEDIA_TIMELINE_LEAD: f32 = 4.0;
-pub const BASE_MEDIA_TIMELINE_LABEL_WIDTH: f32 = 34.0;
-pub const BASE_MEDIA_TIMELINE_LABEL_GAP: f32 = 7.0;
+pub const BASE_MEDIA_TIMELINE_LABEL_WIDTH: f32 = 28.0;
+pub const BASE_MEDIA_TIMELINE_LABEL_GAP: f32 = 4.0;
 pub const BASE_MEDIA_TIMELINE_TRACK: f32 = 5.0;
 pub const BASE_MEDIA_TIMELINE_FONT_SIZE: f32 = 10.0;
 /// Narrowest track worth drawing; below this the scrubber is omitted.
@@ -287,6 +376,51 @@ pub const COLOR_ARTWORK_HAIRLINE: D2D1_COLOR_F = D2D1_COLOR_F {
     b: 1.0,
     a: 0.08,
 };
+
+/// Selected space pill: a quiet lift off the black surface
+pub const COLOR_SPACE_PILL_SELECTED: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 1.0,
+    g: 1.0,
+    b: 1.0,
+    a: 0.13,
+};
+
+/// Drop page outline (dashes) and inbox glyph.
+pub const COLOR_DROP_OUTLINE: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 1.0,
+    g: 1.0,
+    b: 1.0,
+    a: 0.38,
+};
+pub const COLOR_DROP_ICON: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 1.0,
+    g: 1.0,
+    b: 1.0,
+    a: 0.9,
+};
+
+/// Clipboard row outline: a faint white hairline on the black notch.
+pub const COLOR_CLIPBOARD_ROW: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 1.0,
+    g: 1.0,
+    b: 1.0,
+    a: 0.18,
+};
+
+/// Home: thin vertical divider between the track text and the time/date
+pub const COLOR_MEDIA_DIVIDER: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 1.0,
+    g: 1.0,
+    b: 1.0,
+    a: 0.14,
+};
+/// Divider placement: this far after the transport controls, and the track
+/// text stops this far before it.
+pub const BASE_MEDIA_DIVIDER_AFTER_CONTROLS: f32 = 40.0;
+pub const BASE_MEDIA_DIVIDER_TEXT_GAP: f32 = 12.0;
+/// Divider thickness (DIP) and how far it stops short of the content top/bottom.
+pub const BASE_MEDIA_DIVIDER_WIDTH: f32 = 1.0;
+pub const BASE_MEDIA_DIVIDER_INSET: f32 = 4.0;
 
 /// Unplayed part of the scrubber track: dark neutral on #000
 pub const COLOR_MEDIA_TRACK_UNPLAYED: D2D1_COLOR_F = D2D1_COLOR_F {
@@ -402,6 +536,25 @@ pub struct NotchDimensions {
 }
 
 impl NotchDimensions {
+    /// Same notch with a different window width (DIP); everything vertical is
+    /// untouched. Used by the Music space's narrower expanded notch. Even pixel
+    /// widths match the animation frames, so settling never shifts by a pixel.
+    pub fn with_width_dip(mut self, width_dip: f32) -> Self {
+        let mut width = (width_dip * self.scale).round() as i32;
+        if width % 2 != 0 {
+            width += 1;
+        }
+        self.width = width;
+        self
+    }
+
+    /// Same notch with a different window height (DIP); shadow margins and
+    /// everything horizontal untouched. Used by the taller Music player.
+    pub fn with_height_dip(mut self, height_dip: f32) -> Self {
+        self.height = (height_dip * self.scale).round() as i32;
+        self
+    }
+
     /// Computes physical pixel dimensions and design parameters for a given state and display DPI.
     /// Standard baseline is 96 DPI (100% Windows scaling).
     pub fn from_state_and_dpi(state: NotchState, dpi: u32) -> Self {
@@ -742,7 +895,8 @@ pub fn is_point_in_notch(
 // 5. ANIMATION MODEL & EASING (Phase 2.5)
 // ============================================================================
 
-/// Target animation duration in milliseconds (~340ms for Apple spring settlement)
+/// Nominal expand/collapse time scale (ms). The springs below settle on their
+/// own; this only sizes the reversal / test time budget.
 pub const ANIMATION_DURATION_MS: u64 = 340;
 
 /// Frame interval in milliseconds (~12ms for fluid ~80 FPS animation ticks)
@@ -754,18 +908,64 @@ pub const ANIMATION_TIMER_ID: usize = 1001;
 /// Dedicated timer ID for minute clock rollover (Phase 3.1)
 pub const CLOCK_TIMER_ID: usize = 1002;
 
-/// Apple Damped Harmonic Spring solver:
-/// Damping ratio zeta = 0.74 (provides a crisp, natural +3% bounce), response = 0.35s
-pub fn apple_spring(progress: f32) -> f32 {
-    let t = progress.clamp(0.0, 1.0) * 0.35;
-    let zeta = 0.74f32;
-    let response = 0.35f32;
-    let omega_n = 2.0 * std::f32::consts::PI / response;
-    let omega_d = omega_n * (1.0 - zeta * zeta).sqrt();
-    let envelope = (-zeta * omega_n * t).exp();
-    let oscillation =
-        (omega_d * t).cos() + (zeta / (1.0 - zeta * zeta).sqrt()) * (omega_d * t).sin();
-    (1.0 - envelope * oscillation).clamp(0.0, 1.05)
+/// A damped spring: damping ratio and response (the undamped period, s).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Spring {
+    pub zeta: f32,
+    pub response: f32,
+}
+
+/// Expand: restrained, ~0.5% overshoot (expand -> tiny continuation -> settle).
+pub const EXPAND_SPRING: Spring = Spring {
+    zeta: 0.86,
+    response: 0.36,
+};
+/// Collapse: critically damped, never passes the collapsed size.
+pub const COLLAPSE_SPRING: Spring = Spring {
+    zeta: 1.0,
+    response: 0.28,
+};
+/// Space switch (and the content blend): critically damped, calm shell.
+pub const SPACE_SPRING: Spring = Spring {
+    zeta: 1.0,
+    response: 0.34,
+};
+
+/// Settled when every geometry value is this close to its target (physical
+/// px) and moving slower than `SETTLE_SPEED_PX` (px/s): the frame no longer
+/// changes, so ending there shows no pop.
+pub const SETTLE_DISTANCE_PX: f32 = 0.25;
+pub const SETTLE_SPEED_PX: f32 = 40.0;
+
+/// Content fades (ms): expanded content fades in once the shell is open
+/// enough (`CONTENT_IN_OPENNESS`) and out right as a collapse begins;
+/// collapsed content fades back in near the collapsed size.
+pub const CONTENT_FADE_MS: f32 = 120.0;
+pub const CONTENT_IN_OPENNESS: f32 = 0.4;
+pub const COLLAPSED_IN_OPENNESS: f32 = 0.3;
+
+impl Spring {
+    /// Exact solution of the spring after `dt_ms` from position `x` with
+    /// velocity `v` (units/s) toward `target`: returns the new (x, v). Exact
+    /// for any frame length, and continuous in position and velocity.
+    pub fn advance(self, x: f32, v: f32, target: f32, dt_ms: f32) -> (f32, f32) {
+        let t = dt_ms.max(0.0) / 1000.0;
+        let w = 2.0 * std::f32::consts::PI / self.response;
+        let a = x - target;
+        if self.zeta >= 1.0 {
+            let b = v + w * a;
+            let e = (-w * t).exp();
+            (target + (a + b * t) * e, (b - w * (a + b * t)) * e)
+        } else {
+            let z = self.zeta;
+            let wd = w * (1.0 - z * z).sqrt();
+            let b = (v + z * w * a) / wd;
+            let e = (-z * w * t).exp();
+            let (s, c) = (wd * t).sin_cos();
+            let x2 = a * c + b * s;
+            (target + e * x2, e * (-z * w * x2 + wd * (b * c - a * s)))
+        }
+    }
 }
 
 /// Cubic ease-out curve: f(t) = 1 - (1 - t)^3
@@ -802,157 +1002,321 @@ pub fn reference_geometry_for_state(state: NotchState) -> (f32, f32, f32, f32, f
     }
 }
 
-/// Animation state tracking transition progress between Collapsed and Expanded states
+/// Notch geometry (DIP): width, height, top shoulder radius, top shoulder
+/// height, bottom corner radius.
+pub type Geometry = [f32; 5];
+
+/// Geometry of a state, the expanded one at a space's window size.
+pub fn geometry_for(state: NotchState, size: (f32, f32)) -> Geometry {
+    let (w, h, top_r, top_h, bot_r) = reference_geometry_for_state(state);
+    match state {
+        NotchState::Collapsed => [w, h, top_r, top_h, bot_r],
+        NotchState::Expanded => [size.0, size.1, top_r, top_h, bot_r],
+    }
+}
+
+/// Which spring drives the shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Motion {
+    Expand,
+    Collapse,
+    /// Expanded to expanded (space switch, drop page).
+    Space,
+}
+
+impl Motion {
+    fn spring(self) -> Spring {
+        match self {
+            Self::Expand => EXPAND_SPRING,
+            Self::Collapse => COLLAPSE_SPRING,
+            Self::Space => SPACE_SPRING,
+        }
+    }
+}
+
+/// What the renderer needs from an animation frame: the content blend between
+/// two scenes and the content opacity.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Transition {
+    pub from: Scene,
+    pub to: Scene,
+    /// 0 = all `from`, 1 = all `to`.
+    pub mix: f32,
+    /// Opacity of the content drawn this frame (expanded or collapsed).
+    pub alpha: f32,
+}
+
+/// Continuous notch animation: every geometry value is a spring (position +
+/// velocity), so a new target (reverse, space change, drop page) continues
+/// from the current position *and* velocity. Content follows the geometry:
+/// time-based fades gated on how open the shell is, plus a blend spring
+/// between the outgoing and incoming scene.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AnimationState {
     pub start_state: NotchState,
     pub target_state: NotchState,
-    pub start_width: f32,
-    pub start_height: f32,
-    pub start_top_r: f32,
-    pub start_top_h: f32,
-    pub start_bottom_r: f32,
-    pub target_width: f32,
-    pub target_height: f32,
-    pub target_top_r: f32,
-    pub target_top_h: f32,
-    pub target_bottom_r: f32,
-    pub elapsed_ms: u64,
-    pub duration_ms: u64,
-    pub progress: f32,
+    pub motion: Motion,
+    pub pos: Geometry,
+    /// DIP per second.
+    pub vel: Geometry,
+    pub target: Geometry,
+    pub expanded_alpha: f32,
+    pub collapsed_alpha: f32,
+    pub scene_from: Scene,
+    pub scene_to: Scene,
+    pub mix: f32,
+    mix_vel: f32,
+    /// DIP to px for the settle threshold.
+    pub scale: f32,
+    pub elapsed_ms: f32,
     pub active: bool,
 }
 
 impl AnimationState {
-    /// Creates a new animation transitioning from `current_state` toward `target_state`.
-    pub fn new(current_state: NotchState, target_state: NotchState) -> Self {
-        let (s_w, s_h, s_top_r, s_top_h, s_bot_r) = reference_geometry_for_state(current_state);
-        let (t_w, t_h, t_top_r, t_top_h, t_bot_r) = reference_geometry_for_state(target_state);
-        Self {
-            start_state: current_state,
-            target_state,
-            start_width: s_w,
-            start_height: s_h,
-            start_top_r: s_top_r,
-            start_top_h: s_top_h,
-            start_bottom_r: s_bot_r,
-            target_width: t_w,
-            target_height: t_h,
-            target_top_r: t_top_r,
-            target_top_h: t_top_h,
-            target_bottom_r: t_bot_r,
-            elapsed_ms: 0,
-            duration_ms: ANIMATION_DURATION_MS,
-            progress: 0.0,
-            active: true,
-        }
-    }
-
-    /// Handles interruption / reversal of an active animation without jumping or leaking resources.
-    /// Uses current interpolated geometry as the new starting point and reverses direction.
-    pub fn reverse_from_current(&self) -> Self {
-        let (cur_w, cur_h, cur_top_r, cur_bot_r) = self.current_logical_geometry();
-        let cur_top_h = self.current_logical_top_h();
-        let new_target = match self.target_state {
-            NotchState::Collapsed => NotchState::Expanded,
-            NotchState::Expanded => NotchState::Collapsed,
+    /// From rest in `from_state` (at `from_size` if expanded) toward
+    /// `to_state` (at `to_size` if expanded), showing `scene`.
+    pub fn start(
+        from_state: NotchState,
+        from_size: (f32, f32),
+        to_state: NotchState,
+        to_size: (f32, f32),
+        scene: Scene,
+    ) -> Self {
+        let motion = match (from_state, to_state) {
+            (_, NotchState::Collapsed) => Motion::Collapse,
+            (NotchState::Collapsed, NotchState::Expanded) => Motion::Expand,
+            (NotchState::Expanded, NotchState::Expanded) => Motion::Space,
         };
-        let (t_w, t_h, t_top_r, t_top_h, t_bot_r) = reference_geometry_for_state(new_target);
-
-        // Scale duration based on remaining distance to keep velocity natural
-        let distance_ratio = ((cur_w - t_w).abs()
-            / (BASE_EXPANDED_WIDTH - BASE_COLLAPSED_WIDTH).max(1.0))
-        .clamp(0.1, 1.0);
-        let duration_ms = ((ANIMATION_DURATION_MS as f32) * distance_ratio).max(60.0) as u64;
-
+        let open = f32::from(u8::from(from_state == NotchState::Expanded));
         Self {
-            start_state: self.target_state,
-            target_state: new_target,
-            start_width: cur_w,
-            start_height: cur_h,
-            start_top_r: cur_top_r,
-            start_top_h: cur_top_h,
-            start_bottom_r: cur_bot_r,
-            target_width: t_w,
-            target_height: t_h,
-            target_top_r: t_top_r,
-            target_top_h: t_top_h,
-            target_bottom_r: t_bot_r,
-            elapsed_ms: 0,
-            duration_ms,
-            progress: 0.0,
+            start_state: from_state,
+            target_state: to_state,
+            motion,
+            pos: geometry_for(from_state, from_size),
+            vel: [0.0; 5],
+            target: geometry_for(to_state, to_size),
+            expanded_alpha: open,
+            collapsed_alpha: 1.0 - open,
+            scene_from: scene,
+            scene_to: scene,
+            mix: 1.0,
+            mix_vel: 0.0,
+            scale: 1.0,
+            elapsed_ms: 0.0,
             active: true,
         }
     }
 
-    /// Advances the animation by `delta_ms`. Returns true if animation is still active.
-    pub fn step(&mut self, delta_ms: u64) -> bool {
+    /// Expand/collapse between the reference (Home) sizes.
+    pub fn new(current_state: NotchState, target_state: NotchState) -> Self {
+        let home = (BASE_EXPANDED_WIDTH, BASE_EXPANDED_HEIGHT);
+        Self::start(
+            current_state,
+            home,
+            target_state,
+            home,
+            Scene::Space(crate::space::NottSpace::Home),
+        )
+    }
+
+    /// Expanded-to-expanded resize (space switch / drop page) with the content
+    /// blending from `from_scene` to `to_scene`.
+    pub fn space(from: (f32, f32), to: (f32, f32), from_scene: Scene, to_scene: Scene) -> Self {
+        let mut anim = Self::start(
+            NotchState::Expanded,
+            from,
+            NotchState::Expanded,
+            to,
+            to_scene,
+        );
+        anim.retarget_scene_from(from_scene);
+        anim
+    }
+
+    fn retarget_scene_from(&mut self, from_scene: Scene) {
+        if from_scene != self.scene_to {
+            self.scene_from = from_scene;
+            self.mix = 0.0;
+        }
+    }
+
+    /// New target state / size mid-flight: position and velocity carry over.
+    pub fn retarget(&mut self, state: NotchState, size: (f32, f32)) {
+        self.motion = match state {
+            NotchState::Collapsed => Motion::Collapse,
+            NotchState::Expanded if self.motion == Motion::Collapse => Motion::Expand,
+            NotchState::Expanded => self.motion,
+        };
+        self.target_state = state;
+        self.target = geometry_for(state, size);
+        self.active = true;
+    }
+
+    /// New scene mid-flight. Back to the outgoing scene: the blend reverses
+    /// from where it is (with its velocity). A third scene: the blend restarts
+    /// from whichever scene currently dominates.
+    pub fn retarget_scene(&mut self, scene: Scene) {
+        if scene == self.scene_to {
+            return;
+        }
+        if scene == self.scene_from {
+            std::mem::swap(&mut self.scene_from, &mut self.scene_to);
+            self.mix = 1.0 - self.mix;
+            self.mix_vel = -self.mix_vel;
+        } else {
+            // ponytail: a third scene mid-blend restarts from the dominant one
+            // (rare: three targets within one transition)
+            if self.mix >= 0.5 {
+                self.scene_from = self.scene_to;
+            }
+            self.scene_to = scene;
+            self.mix = 0.0;
+            self.mix_vel = 0.0;
+        }
+        self.active = true;
+    }
+
+    /// True for an expanded-to-expanded transition (no expand/collapse).
+    pub fn is_space_transition(&self) -> bool {
+        self.motion == Motion::Space
+    }
+
+    /// How open the shell is: 0 at the collapsed height, 1 from the smallest
+    /// expanded (Home) height up. Drives margins, shadow and content fades.
+    pub fn openness(&self) -> f32 {
+        ((self.pos[1] - BASE_COLLAPSED_HEIGHT) / (BASE_EXPANDED_HEIGHT - BASE_COLLAPSED_HEIGHT))
+            .clamp(0.0, 1.0)
+    }
+
+    /// Advances by `dt_ms` (fractional frame time). Returns true while still
+    /// moving; once settled the geometry is exactly the target.
+    pub fn step(&mut self, dt_ms: f32) -> bool {
         if !self.active {
             return false;
         }
-        self.elapsed_ms += delta_ms;
-        if self.elapsed_ms >= self.duration_ms {
-            self.progress = 1.0;
+        self.elapsed_ms += dt_ms;
+        let spring = self.motion.spring();
+        for i in 0..5 {
+            (self.pos[i], self.vel[i]) =
+                spring.advance(self.pos[i], self.vel[i], self.target[i], dt_ms);
+        }
+        if self.motion == Motion::Collapse {
+            // Never smaller than the collapsed notch
+            for i in 0..2 {
+                if self.pos[i] < self.target[i] {
+                    self.pos[i] = self.target[i];
+                    self.vel[i] = self.vel[i].max(0.0);
+                }
+            }
+        }
+        (self.mix, self.mix_vel) = SPACE_SPRING.advance(self.mix, self.mix_vel, 1.0, dt_ms);
+        self.mix = self.mix.clamp(0.0, 1.0);
+
+        // Content fades, gated on the shell's openness
+        let open = self.openness();
+        let expanding = self.target_state == NotchState::Expanded;
+        let fade = |a: f32, on: bool| {
+            let d = dt_ms / CONTENT_FADE_MS;
+            if on {
+                (a + d).min(1.0)
+            } else {
+                (a - d).max(0.0)
+            }
+        };
+        let show_expanded = expanding && (open >= CONTENT_IN_OPENNESS || self.expanded_alpha > 0.0);
+        self.expanded_alpha = fade(self.expanded_alpha, show_expanded);
+        self.collapsed_alpha = fade(
+            self.collapsed_alpha,
+            !expanding && open <= COLLAPSED_IN_OPENNESS,
+        );
+
+        let px = |d: f32| d * self.scale;
+        let settled = (0..5).all(|i| {
+            px((self.pos[i] - self.target[i]).abs()) < SETTLE_DISTANCE_PX
+                && px(self.vel[i].abs()) < SETTLE_SPEED_PX
+        }) && (1.0 - self.mix) < 1e-3
+            && self.mix_vel.abs() < 0.05
+            && self.expanded_alpha == f32::from(u8::from(expanding))
+            && self.collapsed_alpha == f32::from(u8::from(!expanding));
+        if settled {
+            self.pos = self.target;
+            self.vel = [0.0; 5];
+            self.mix = 1.0;
+            self.mix_vel = 0.0;
+            self.scene_from = self.scene_to;
             self.active = false;
-        } else {
-            self.progress = (self.elapsed_ms as f32 / self.duration_ms as f32).clamp(0.0, 1.0);
         }
         self.active
     }
 
-    /// Explicitly sets normalized progress in [0.0, 1.0] (useful for deterministic tests).
+    /// Test helper: advances (12 ms frames) to `p` of the nominal duration;
+    /// `p >= 1` runs until settled. Progress only moves forward.
+    #[cfg(test)]
     pub fn set_progress(&mut self, p: f32) {
-        self.progress = p.clamp(0.0, 1.0);
-        if self.progress >= 1.0 {
-            self.active = false;
+        if p >= 1.0 {
+            self.run_for(f32::MAX);
+            return;
+        }
+        let goal = p.max(0.0) * ANIMATION_DURATION_MS as f32;
+        while self.elapsed_ms + 6.0 < goal && self.step(ANIMATION_FRAME_INTERVAL_MS as f32) {}
+    }
+
+    /// Steps in 12 ms frames until settled (or `max_ms`); deterministic tests.
+    #[cfg(test)]
+    pub fn run_for(&mut self, ms: f32) {
+        let mut t = 0.0;
+        while t < ms && self.step(ANIMATION_FRAME_INTERVAL_MS as f32) {
+            t += ANIMATION_FRAME_INTERVAL_MS as f32;
         }
     }
 
-    /// Returns the current logical dimensions (unscaled DIP) taking Apple spring physics into account.
+    /// Current logical (width, height, top radius, bottom radius) in DIP.
     pub fn current_logical_geometry(&self) -> (f32, f32, f32, f32) {
-        let e = if self.progress >= 1.0 {
-            1.0
-        } else {
-            apple_spring(self.progress)
-        };
-        let w = lerp(self.start_width, self.target_width, e);
-        let h = lerp(self.start_height, self.target_height, e);
-        let top_r = lerp(self.start_top_r, self.target_top_r, e.min(1.0));
-        let bot_r = lerp(self.start_bottom_r, self.target_bottom_r, e.min(1.0));
-        (w, h, top_r, bot_r)
+        (self.pos[0], self.pos[1], self.pos[2], self.pos[4])
     }
 
-    /// Returns the current logical top shoulder height.
-    pub fn current_logical_top_h(&self) -> f32 {
-        let e = if self.progress >= 1.0 {
-            1.0
-        } else {
-            apple_spring(self.progress)
-        };
-        lerp(self.start_top_h, self.target_top_h, e.min(1.0))
+    /// What the renderer shows this frame.
+    pub fn transition(&self) -> Transition {
+        Transition {
+            from: self.scene_from,
+            to: self.scene_to,
+            mix: self.mix,
+            alpha: if self.expanded_alpha > 0.0 {
+                self.expanded_alpha
+            } else {
+                self.collapsed_alpha
+            },
+        }
     }
 
     /// Computes physical NotchDimensions for the current animation frame given display DPI.
     pub fn current_dimensions(&self, dpi: u32) -> NotchDimensions {
         let scale = if dpi == 0 { 1.0 } else { dpi as f32 / BASE_DPI };
-        let (log_w, log_h, log_top_r, log_bot_r) = self.current_logical_geometry();
-        let log_top_h = self.current_logical_top_h();
+        let [log_w, log_h, log_top_r, log_top_h, log_bot_r] = self.pos;
 
         let top_transition_radius = log_top_r * scale;
         let top_transition_height = log_top_h * scale;
         let bottom_radius = log_bot_r * scale;
 
-        // When progress > 0.5 or complete, state resolves to target_state
-        let state = if !self.active || self.progress > 0.5 {
-            self.target_state
+        // Expanded while expanded content is (fading) visible
+        let state = if self.expanded_alpha > 0.0 {
+            NotchState::Expanded
         } else {
-            self.start_state
+            NotchState::Collapsed
         };
 
-        let mut width = (log_w * scale).round() as i32;
-        if width % 2 != 0 {
-            width += 1;
-        }
+        // Width moves in 2 px steps (1 px per side keeps it centred) and lands
+        // exactly on the target's settled width, odd or even
+        let target_w = (self.target[0] * scale).round() as i32;
+        let width = target_w + 2 * ((log_w * scale - target_w as f32) / 2.0).round() as i32;
+        // Margins and shadow follow the shell's actual openness, unrounded
+        // (no 1 px stepping), reaching exactly the settled values at the ends
+        let open = self.openness();
+        let (pad_h, pad_v) = if state == NotchState::Expanded {
+            (BASE_EXPANDED_PADDING_H, BASE_EXPANDED_PADDING_V)
+        } else {
+            (BASE_COLLAPSED_PADDING_H, BASE_COLLAPSED_PADDING_V)
+        };
 
         NotchDimensions {
             state,
@@ -965,8 +1329,8 @@ impl AnimationState {
                 top_transition_height,
             },
             border_width: (BASE_BORDER_WIDTH * scale).max(1.0),
-            padding_h: (BASE_COLLAPSED_PADDING_H * scale).round(),
-            padding_v: (BASE_COLLAPSED_PADDING_V * scale).round(),
+            padding_h: (pad_h * scale).round(),
+            padding_v: (pad_v * scale).round(),
             spacing: (BASE_SPACING * scale).round(),
             icon_size_default: (BASE_ICON_SIZE_DEFAULT * scale).round(),
             icon_size_small: (BASE_ICON_SIZE_SMALL * scale).round(),
@@ -978,26 +1342,9 @@ impl AnimationState {
             font_size_expanded_date: BASE_EXPANDED_FONT_SIZE_DATE * scale,
             dpi: if dpi == 0 { 96 } else { dpi },
             scale,
-            shadow_margin_x: match self.target_state {
-                NotchState::Expanded => {
-                    (BASE_EXPANDED_SHADOW_MARGIN_X * scale * self.progress).round()
-                }
-                NotchState::Collapsed => {
-                    (BASE_EXPANDED_SHADOW_MARGIN_X * scale * (1.0 - self.progress)).round()
-                }
-            },
-            shadow_margin_bottom: match self.target_state {
-                NotchState::Expanded => {
-                    (BASE_EXPANDED_SHADOW_MARGIN_BOTTOM * scale * self.progress).round()
-                }
-                NotchState::Collapsed => {
-                    (BASE_EXPANDED_SHADOW_MARGIN_BOTTOM * scale * (1.0 - self.progress)).round()
-                }
-            },
-            shadow_opacity: match self.target_state {
-                NotchState::Expanded => BASE_EXPANDED_SHADOW_OPACITY * self.progress,
-                NotchState::Collapsed => BASE_EXPANDED_SHADOW_OPACITY * (1.0 - self.progress),
-            },
+            shadow_margin_x: (BASE_EXPANDED_SHADOW_MARGIN_X * scale).round() * open,
+            shadow_margin_bottom: (BASE_EXPANDED_SHADOW_MARGIN_BOTTOM * scale).round() * open,
+            shadow_opacity: BASE_EXPANDED_SHADOW_OPACITY * open,
         }
     }
 }
@@ -1148,6 +1495,7 @@ impl AccessibilityEventTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::space::Scene;
 
     #[test]
     fn test_dpi_dimension_scaling() {
@@ -1393,7 +1741,7 @@ mod tests {
         assert_eq!(BASE_WIDTH, BASE_COLLAPSED_WIDTH);
         assert_eq!(BASE_HEIGHT, BASE_COLLAPSED_HEIGHT);
         assert_eq!(BASE_EXPANDED_WIDTH, 600.0);
-        assert_eq!(BASE_EXPANDED_HEIGHT, 128.0);
+        assert_eq!(BASE_EXPANDED_HEIGHT, 138.0);
 
         // Typography and icon scaling at 150% (144 DPI)
         let dims_150 = NotchDimensions::from_dpi(144);
@@ -1417,7 +1765,7 @@ mod tests {
         // 100% scaling: 96 DPI
         let dims_100 = NotchDimensions::from_state_and_dpi(NotchState::Expanded, 96);
         assert_eq!(dims_100.width, 600);
-        assert_eq!(dims_100.height, 128);
+        assert_eq!(dims_100.height, 138);
         assert_eq!(dims_100.state, NotchState::Expanded);
         assert!((dims_100.corner_radius - BASE_EXPANDED_BOTTOM_CORNER_RADIUS).abs() < 1e-4);
         assert!(
@@ -1428,14 +1776,14 @@ mod tests {
         assert_eq!(dims_100.shadow_margin_x, 10.0);
         assert_eq!(dims_100.shadow_margin_bottom, 18.0);
         assert_eq!(dims_100.notch_width(), 580.0);
-        assert_eq!(dims_100.notch_height(), 110.0);
+        assert_eq!(dims_100.notch_height(), 120.0);
         assert_eq!(dims_100.padding_h, 18.0);
         assert_eq!(dims_100.padding_v, 12.0);
 
         // 125% scaling: 120 DPI
         let dims_125 = NotchDimensions::from_state_and_dpi(NotchState::Expanded, 120);
         assert_eq!(dims_125.width, 750);
-        assert_eq!(dims_125.height, 160);
+        assert_eq!(dims_125.height, 173);
         assert!((dims_125.corner_radius - BASE_EXPANDED_BOTTOM_CORNER_RADIUS * 1.25).abs() < 1e-4);
         assert!(
             (dims_125.curvature.bottom_radius - BASE_EXPANDED_BOTTOM_CORNER_RADIUS * 1.25).abs()
@@ -1447,7 +1795,7 @@ mod tests {
         // 150% scaling: 144 DPI
         let dims_150 = NotchDimensions::from_state_and_dpi(NotchState::Expanded, 144);
         assert_eq!(dims_150.width, 900);
-        assert_eq!(dims_150.height, 192);
+        assert_eq!(dims_150.height, 207);
         assert!((dims_150.corner_radius - BASE_EXPANDED_BOTTOM_CORNER_RADIUS * 1.5).abs() < 1e-4);
         assert!(
             (dims_150.curvature.bottom_radius - BASE_EXPANDED_BOTTOM_CORNER_RADIUS * 1.5).abs()
@@ -1459,7 +1807,7 @@ mod tests {
         // 175% scaling: 168 DPI
         let dims_175 = NotchDimensions::from_state_and_dpi(NotchState::Expanded, 168);
         assert_eq!(dims_175.width, 1050);
-        assert_eq!(dims_175.height, 224);
+        assert_eq!(dims_175.height, 242);
         assert!((dims_175.corner_radius - BASE_EXPANDED_BOTTOM_CORNER_RADIUS * 1.75).abs() < 1e-4);
         assert!(
             (dims_175.curvature.bottom_radius - BASE_EXPANDED_BOTTOM_CORNER_RADIUS * 1.75).abs()
@@ -1471,7 +1819,7 @@ mod tests {
         // 200% scaling: 192 DPI
         let dims_200 = NotchDimensions::from_state_and_dpi(NotchState::Expanded, 192);
         assert_eq!(dims_200.width, 1200);
-        assert_eq!(dims_200.height, 256);
+        assert_eq!(dims_200.height, 276);
         assert!((dims_200.corner_radius - BASE_EXPANDED_BOTTOM_CORNER_RADIUS * 2.0).abs() < 1e-4);
         assert!(
             (dims_200.curvature.bottom_radius - BASE_EXPANDED_BOTTOM_CORNER_RADIUS * 2.0).abs()
@@ -1484,12 +1832,12 @@ mod tests {
         let dims_137 = NotchDimensions::from_state_and_dpi(NotchState::Expanded, 137);
         let scale_137 = 137.0f32 / 96.0;
         assert_eq!(dims_137.width, (600.0f32 * scale_137).round() as i32);
-        assert_eq!(dims_137.height, (128.0f32 * scale_137).round() as i32);
+        assert_eq!(dims_137.height, (138.0f32 * scale_137).round() as i32);
 
         // High DPI: 288 DPI
         let dims_288 = NotchDimensions::from_state_and_dpi(NotchState::Expanded, 288);
         assert_eq!(dims_288.width, 1800);
-        assert_eq!(dims_288.height, 384);
+        assert_eq!(dims_288.height, 414);
         assert!((dims_288.corner_radius - BASE_EXPANDED_BOTTOM_CORNER_RADIUS * 3.0).abs() < 1e-4);
         assert!(
             (dims_288.curvature.bottom_radius - BASE_EXPANDED_BOTTOM_CORNER_RADIUS * 3.0).abs()
@@ -1501,7 +1849,7 @@ mod tests {
         // Zero DPI fallback
         let dims_zero = NotchDimensions::from_state_and_dpi(NotchState::Expanded, 0);
         assert_eq!(dims_zero.width, 600);
-        assert_eq!(dims_zero.height, 128);
+        assert_eq!(dims_zero.height, 138);
         assert_eq!(dims_zero.dpi, 96);
     }
 
@@ -1679,7 +2027,7 @@ mod tests {
         match layout_e {
             crate::layout::ResolvedLayout::Expanded { bounds, components } => {
                 assert_eq!(bounds.width(), 600.0);
-                assert_eq!(bounds.height(), 128.0);
+                assert_eq!(bounds.height(), 138.0);
                 assert!(components.content_bounds.width() > 0.0);
                 assert!(components.time_bounds.width() > 0.0);
                 assert!(components.date_bounds.width() > 0.0);
@@ -1755,41 +2103,36 @@ mod tests {
         assert!(anim.active);
         assert_eq!(anim.start_state, NotchState::Collapsed);
         assert_eq!(anim.target_state, NotchState::Expanded);
-        assert_eq!(anim.start_width, BASE_COLLAPSED_WIDTH);
-        assert_eq!(anim.target_width, BASE_EXPANDED_WIDTH);
-        assert_eq!(anim.start_height, BASE_COLLAPSED_HEIGHT);
-        assert_eq!(anim.target_height, BASE_EXPANDED_HEIGHT);
-        assert_eq!(anim.progress, 0.0);
+        assert_eq!(anim.motion, Motion::Expand);
+        assert_eq!(anim.pos, geometry_for(NotchState::Collapsed, (0.0, 0.0)));
+        assert_eq!(anim.target, geometry_for(NotchState::Expanded, HOME));
+        assert_eq!(anim.vel, [0.0; 5], "starts at rest");
+        assert_eq!((anim.expanded_alpha, anim.collapsed_alpha), (0.0, 1.0));
     }
 
     #[test]
     fn test_animation_expanded_to_collapsed_starts() {
         let anim = AnimationState::new(NotchState::Expanded, NotchState::Collapsed);
         assert!(anim.active);
-        assert_eq!(anim.start_state, NotchState::Expanded);
-        assert_eq!(anim.target_state, NotchState::Collapsed);
-        assert_eq!(anim.start_width, BASE_EXPANDED_WIDTH);
-        assert_eq!(anim.target_width, BASE_COLLAPSED_WIDTH);
-        assert_eq!(anim.start_height, BASE_EXPANDED_HEIGHT);
-        assert_eq!(anim.target_height, BASE_COLLAPSED_HEIGHT);
-        assert_eq!(anim.progress, 0.0);
+        assert_eq!(anim.motion, Motion::Collapse);
+        assert_eq!(anim.pos, geometry_for(NotchState::Expanded, HOME));
+        assert_eq!(anim.target, geometry_for(NotchState::Collapsed, (0.0, 0.0)));
+        assert_eq!((anim.expanded_alpha, anim.collapsed_alpha), (1.0, 0.0));
     }
 
     #[test]
-    fn test_animation_progress_clamping_and_completion() {
-        let mut anim = AnimationState::new(NotchState::Collapsed, NotchState::Expanded);
-        anim.set_progress(-0.5);
-        assert_eq!(anim.progress, 0.0);
-        assert!(anim.active);
-
-        anim.set_progress(1.5);
-        assert_eq!(anim.progress, 1.0);
-        assert!(!anim.active);
-
-        let mut anim2 = AnimationState::new(NotchState::Collapsed, NotchState::Expanded);
-        anim2.step(500);
-        assert_eq!(anim2.progress, 1.0);
-        assert!(!anim2.active);
+    fn test_animation_completes_exactly_at_target() {
+        for (from, to) in [
+            (NotchState::Collapsed, NotchState::Expanded),
+            (NotchState::Expanded, NotchState::Collapsed),
+        ] {
+            let mut anim = AnimationState::new(from, to);
+            let f = frames(&mut anim);
+            assert!(!anim.active);
+            assert_eq!(anim.pos, anim.target);
+            assert_eq!(*f.last().unwrap(), anim.target);
+            assert!(!anim.step(12.0), "stays settled");
+        }
     }
 
     #[test]
@@ -1839,7 +2182,7 @@ mod tests {
 
         let dims = anim.current_dimensions(96);
         assert_eq!(dims.width, 600);
-        assert_eq!(dims.height, 128);
+        assert_eq!(dims.height, 138);
         assert_eq!(dims.state, NotchState::Expanded);
     }
 
@@ -1871,8 +2214,8 @@ mod tests {
             let center_x = calculate_notch_center_x(screen_width, dims.width);
             assert!(
                 (center_x - expected_center).abs() < 1e-4,
-                "Center X must remain invariant throughout animation (progress={})",
-                anim.progress
+                "Center X must remain invariant throughout animation ({} ms)",
+                anim.elapsed_ms
             );
         }
     }
@@ -1887,17 +2230,15 @@ mod tests {
     #[test]
     fn test_reversing_active_animation_continuity() {
         let mut anim = AnimationState::new(NotchState::Collapsed, NotchState::Expanded);
-        anim.set_progress(0.4);
-        let (w_mid, h_mid, _, _) = anim.current_logical_geometry();
-
-        // Reverse mid-animation
-        let reversed = anim.reverse_from_current();
-        assert!(reversed.active);
-        assert_eq!(reversed.target_state, NotchState::Collapsed);
-        assert_eq!(reversed.start_width, w_mid);
-        assert_eq!(reversed.start_height, h_mid);
-        assert_eq!(reversed.target_width, BASE_COLLAPSED_WIDTH);
-        assert_eq!(reversed.target_height, BASE_COLLAPSED_HEIGHT);
+        anim.run_for(96.0);
+        let (pos, vel) = (anim.pos, anim.vel);
+        assert!(vel[0] > 0.0, "opening");
+        anim.retarget(NotchState::Collapsed, HOME);
+        // Same place, same velocity: only the target changed
+        assert_eq!(anim.pos, pos);
+        assert_eq!(anim.vel, vel);
+        assert_eq!(anim.target, geometry_for(NotchState::Collapsed, HOME));
+        assert_eq!(anim.motion, Motion::Collapse);
     }
 
     #[test]
@@ -1910,7 +2251,7 @@ mod tests {
         assert!(interaction.hovered);
         // Animation state remains unaffected
         assert_eq!(anim.target_state, NotchState::Expanded);
-        assert_eq!(anim.progress, 0.0);
+        assert_eq!(anim.elapsed_ms, 0.0);
     }
 
     #[test]
@@ -2093,9 +2434,9 @@ mod tests {
 
         // Step through 15 intermediate frames (~240ms)
         for _ in 0..15 {
-            anim.step(16);
+            anim.step(16.0);
             if anim.active {
-                assert!(!tracker.on_animation_frame(anim.progress));
+                assert!(!tracker.on_animation_frame(anim.openness()));
                 assert_eq!(tracker.name_change_count, names_before);
                 assert_eq!(tracker.state_change_count, states_before);
             }
@@ -2112,8 +2453,8 @@ mod tests {
 
         // Intermediate animation frames emit 0 events
         let mut anim = AnimationState::new(NotchState::Collapsed, NotchState::Expanded);
-        while anim.step(16) {
-            assert!(!tracker.on_animation_frame(anim.progress));
+        while anim.step(16.0) {
+            assert!(!tracker.on_animation_frame(anim.openness()));
         }
         assert_eq!(tracker.name_change_count, 1);
         assert_eq!(tracker.state_change_count, 1);
@@ -2138,8 +2479,8 @@ mod tests {
 
         // Intermediate animation frames emit 0 events
         let mut anim = AnimationState::new(NotchState::Expanded, NotchState::Collapsed);
-        while anim.step(16) {
-            assert!(!tracker.on_animation_frame(anim.progress));
+        while anim.step(16.0) {
+            assert!(!tracker.on_animation_frame(anim.openness()));
         }
         assert_eq!(tracker.name_change_count, 1);
 
@@ -2319,6 +2660,372 @@ mod tests {
                 0.0
             };
             assert!((prev - end).abs() < 1e-4);
+        }
+    }
+
+    /// Runs 12 ms frames until settled; every frame's geometry.
+    fn frames(anim: &mut AnimationState) -> Vec<Geometry> {
+        let mut out = Vec::new();
+        while anim.step(12.0) {
+            out.push(anim.pos);
+            assert!(out.len() < 200, "must settle");
+        }
+        out.push(anim.pos);
+        out
+    }
+
+    const CLIPBOARD: (f32, f32) = (440.0, 202.0);
+    const SPACES: [(f32, f32); 3] = [HOME, MUSIC, CLIPBOARD];
+
+    #[test]
+    fn test_spring_solution_is_exact_and_continuous() {
+        // Two half frames equal one full frame (exact solution, any frame time)
+        for spring in [EXPAND_SPRING, COLLAPSE_SPRING, SPACE_SPRING] {
+            let (x1, v1) = spring.advance(0.0, 300.0, 100.0, 12.0);
+            let (xa, va) = spring.advance(0.0, 300.0, 100.0, 6.0);
+            let (x2, v2) = spring.advance(xa, va, 100.0, 6.0);
+            assert!((x1 - x2).abs() < 1e-3 && (v1 - v2).abs() < 1e-2);
+            assert_eq!(spring.advance(5.0, 7.0, 1.0, 0.0), (5.0, 7.0));
+        }
+    }
+
+    #[test]
+    fn test_expand_overshoot_is_tiny() {
+        for size in SPACES {
+            let mut anim = AnimationState::start(
+                NotchState::Collapsed,
+                (0.0, 0.0),
+                NotchState::Expanded,
+                size,
+                Scene::Space(crate::space::NottSpace::Home),
+            );
+            let f = frames(&mut anim);
+            for (i, target) in [(0, size.0), (1, size.1)] {
+                let start = geometry_for(NotchState::Collapsed, (0.0, 0.0))[i];
+                let peak = f.iter().map(|g| g[i]).fold(f32::MIN, f32::max);
+                let overshoot = (peak - target) / (target - start);
+                assert!(overshoot <= 0.01, "{size:?}[{i}] overshoot {overshoot}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_collapse_never_dips_below_collapsed_size() {
+        let collapsed = geometry_for(NotchState::Collapsed, (0.0, 0.0));
+        for size in SPACES {
+            let mut anim = AnimationState::new(NotchState::Expanded, NotchState::Collapsed);
+            anim.pos = geometry_for(NotchState::Expanded, size);
+            for g in frames(&mut anim) {
+                assert!(g[0] >= collapsed[0] && g[1] >= collapsed[1], "{g:?}");
+            }
+            // ...even when collapsing out of a fast shrinking space switch
+            let mut anim = AnimationState::space(HOME, MUSIC, scene(), scene());
+            anim.run_for(60.0);
+            anim.retarget(NotchState::Collapsed, MUSIC);
+            for g in frames(&mut anim) {
+                assert!(g[0] >= collapsed[0] && g[1] >= collapsed[1], "{g:?}");
+            }
+        }
+    }
+
+    fn scene() -> Scene {
+        Scene::Space(crate::space::NottSpace::Home)
+    }
+
+    #[test]
+    fn test_last_frame_is_at_target_no_end_pop() {
+        // Every kind of transition, at several scales: the frame before the
+        // settle snap is already within 0.5 px of the target
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let mut cases = vec![
+                AnimationState::new(NotchState::Collapsed, NotchState::Expanded),
+                AnimationState::new(NotchState::Expanded, NotchState::Collapsed),
+            ];
+            for (a, b) in [(HOME, MUSIC), (MUSIC, CLIPBOARD), (CLIPBOARD, HOME)] {
+                cases.push(AnimationState::space(a, b, scene(), scene()));
+            }
+            for mut anim in cases {
+                anim.scale = scale;
+                let f = frames(&mut anim);
+                let before_snap = f[f.len() - 2];
+                for (g, t) in before_snap.iter().zip(anim.target) {
+                    let px = (g - t).abs() * scale;
+                    assert!(px <= 0.5, "{px} px from target at {scale}x");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_settles_in_bounded_time() {
+        // Visually complete (within 1 DIP) by ~420 ms; the timer stops once
+        // the sub-pixel tail settles (<= 600 ms)
+        let mut cases = vec![
+            AnimationState::new(NotchState::Collapsed, NotchState::Expanded),
+            AnimationState::new(NotchState::Expanded, NotchState::Collapsed),
+        ];
+        for (a, b) in [(HOME, MUSIC), (MUSIC, CLIPBOARD), (CLIPBOARD, HOME)] {
+            cases.push(AnimationState::space(a, b, scene(), scene()));
+        }
+        for mut anim in cases {
+            anim.scale = 1.25;
+            let target = anim.target;
+            let f = frames(&mut anim);
+            let within = f
+                .iter()
+                .position(|g| (0..5).all(|i| (g[i] - target[i]).abs() < 1.0))
+                .unwrap();
+            assert!(
+                (within + 1) * 12 <= 420,
+                "within 1 DIP at {} ms",
+                (within + 1) * 12
+            );
+            assert!(
+                anim.elapsed_ms <= 600.0,
+                "settled at {} ms",
+                anim.elapsed_ms
+            );
+        }
+    }
+
+    #[test]
+    fn test_space_switch_has_no_visible_overshoot() {
+        for (a, b) in [
+            (HOME, MUSIC),
+            (MUSIC, HOME),
+            (MUSIC, CLIPBOARD),
+            (CLIPBOARD, HOME),
+        ] {
+            let mut anim = AnimationState::space(a, b, scene(), scene());
+            for g in frames(&mut anim) {
+                for (i, (from, to)) in [(0, (a.0, b.0)), (1, (a.1, b.1))] {
+                    let (lo, hi) = (f32::min(from, to), f32::max(from, to));
+                    assert!(g[i] >= lo - 0.05 && g[i] <= hi + 0.05, "{g:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_reversal_keeps_velocity_no_stall() {
+        for (a, b) in [(HOME, MUSIC), (MUSIC, CLIPBOARD)] {
+            let (sa, sb) = (
+                Scene::Space(crate::space::NottSpace::Home),
+                Scene::Space(crate::space::NottSpace::Music),
+            );
+            let mut anim = AnimationState::space(a, b, sa, sb);
+            anim.run_for(110.0);
+            let (pos, vel, mix) = (anim.pos, anim.vel, anim.mix);
+            assert!(mix > 0.2 && mix < 0.9, "mid transition: {mix}");
+            anim.retarget(NotchState::Expanded, a);
+            anim.retarget_scene(sa);
+            assert_eq!((anim.pos, anim.vel), (pos, vel), "continues from here");
+            assert!(
+                (anim.mix - (1.0 - mix)).abs() < 1e-6,
+                "content blend reverses in place"
+            );
+            // The next frame keeps moving the way it was going (no stall), and
+            // no frame jumps
+            anim.step(12.0);
+            let moved = anim.pos[0] - pos[0];
+            assert!(
+                moved.signum() == vel[0].signum() && moved.abs() > 0.2,
+                "{moved}"
+            );
+            let mut prev = anim.pos;
+            while anim.step(12.0) {
+                assert!((anim.pos[0] - prev[0]).abs() < 30.0);
+                assert!((anim.pos[1] - prev[1]).abs() < 30.0);
+                prev = anim.pos;
+            }
+            assert_eq!(anim.pos, geometry_for(NotchState::Expanded, a));
+            assert_eq!((anim.scene_from, anim.scene_to, anim.mix), (sa, sa, 1.0));
+        }
+    }
+
+    #[test]
+    fn test_mid_flight_retarget_reaches_new_target_without_snap() {
+        // Opening toward Home, the drop page retargets it to the Clipboard size
+        let mut anim = AnimationState::new(NotchState::Collapsed, NotchState::Expanded);
+        anim.scale = 1.25;
+        anim.run_for(84.0);
+        let vel = anim.vel;
+        anim.retarget(NotchState::Expanded, CLIPBOARD);
+        anim.retarget_scene(Scene::Drop);
+        assert_eq!(anim.vel, vel);
+        assert_eq!(anim.motion, Motion::Expand, "still the opening spring");
+        let f = frames(&mut anim);
+        let before_snap = f[f.len() - 2];
+        assert!((0..5).all(|i| (before_snap[i] - anim.target[i]).abs() * 1.25 <= 0.5));
+        assert_eq!(anim.pos, geometry_for(NotchState::Expanded, CLIPBOARD));
+        assert_eq!(anim.scene_to, Scene::Drop);
+    }
+
+    #[test]
+    fn test_content_fades_are_monotonic_and_timed() {
+        // Expand: collapsed content only fades out, expanded only fades in
+        let mut anim = AnimationState::new(NotchState::Collapsed, NotchState::Expanded);
+        let (mut ea, mut ca) = (0.0, 1.0);
+        let mut first_in = None;
+        while anim.step(12.0) {
+            assert!(anim.expanded_alpha >= ea && anim.collapsed_alpha <= ca);
+            if anim.expanded_alpha > 0.0 && first_in.is_none() {
+                first_in = Some(anim.openness());
+            }
+            (ea, ca) = (anim.expanded_alpha, anim.collapsed_alpha);
+        }
+        assert!(
+            first_in.unwrap() >= CONTENT_IN_OPENNESS,
+            "only once there is room"
+        );
+        assert_eq!((anim.expanded_alpha, anim.collapsed_alpha), (1.0, 0.0));
+        // Collapse: expanded content leaves early, collapsed returns at the end
+        let mut anim = AnimationState::new(NotchState::Expanded, NotchState::Collapsed);
+        let (mut ea, mut ca) = (1.0, 0.0);
+        let mut gone_at = None;
+        while anim.step(12.0) {
+            assert!(anim.expanded_alpha <= ea && anim.collapsed_alpha >= ca);
+            if anim.expanded_alpha == 0.0 && gone_at.is_none() {
+                gone_at = Some(anim.elapsed_ms);
+            }
+            if anim.collapsed_alpha > 0.0 {
+                assert!(anim.openness() <= COLLAPSED_IN_OPENNESS + 0.05);
+            }
+            (ea, ca) = (anim.expanded_alpha, anim.collapsed_alpha);
+        }
+        assert!(gone_at.unwrap() <= 132.0, "fades out in the first ~30%");
+        assert_eq!((anim.expanded_alpha, anim.collapsed_alpha), (0.0, 1.0));
+    }
+
+    #[test]
+    fn test_drop_page_blend_keeps_geometry_and_settles() {
+        // Clipboard-size space -> drop page: same shell, content blends
+        let mut anim = AnimationState::space(
+            CLIPBOARD,
+            CLIPBOARD,
+            Scene::Space(crate::space::NottSpace::Clipboard),
+            Scene::Drop,
+        );
+        assert_eq!(anim.mix, 0.0);
+        let mut prev = 0.0;
+        for g in frames(&mut anim) {
+            assert_eq!(g, geometry_for(NotchState::Expanded, CLIPBOARD));
+            assert!(anim.mix >= prev);
+            prev = anim.mix;
+        }
+        assert_eq!(
+            (anim.scene_from, anim.scene_to, anim.mix),
+            (Scene::Drop, Scene::Drop, 1.0)
+        );
+        // Same scene and size: nothing to animate beyond the first frame
+        let mut idle = AnimationState::space(HOME, HOME, scene(), scene());
+        assert!(!idle.step(12.0));
+    }
+
+    /// Home and Music expanded window sizes (DIP) as the layout defines them.
+    const HOME: (f32, f32) = (600.0, 138.0);
+    const MUSIC: (f32, f32) = (384.0, 158.0);
+
+    fn settled(dpi: u32, size: (f32, f32)) -> NotchDimensions {
+        NotchDimensions::from_state_and_dpi(NotchState::Expanded, dpi)
+            .with_width_dip(size.0)
+            .with_height_dip(size.1)
+    }
+
+    #[test]
+    fn test_space_transition_reaches_width_and_height() {
+        for dpi in [96u32, 120, 137, 144, 168, 192, 288] {
+            let home = NotchDimensions::from_state_and_dpi(NotchState::Expanded, dpi);
+            assert_eq!(
+                settled(dpi, HOME).height,
+                home.height,
+                "Home height unchanged"
+            );
+            for (from, to) in [(HOME, MUSIC), (MUSIC, HOME)] {
+                let mut anim = AnimationState::space(from, to, scene(), scene());
+                assert!(anim.is_space_transition());
+                let start = anim.current_dimensions(dpi);
+                assert!((start.width - settled(dpi, from).width).abs() <= 1);
+                assert_eq!(
+                    start.height,
+                    settled(dpi, from).height,
+                    "start height at {dpi}"
+                );
+                while anim.step(12.0) {
+                    let d = anim.current_dimensions(dpi);
+                    // Only the window size moves: margins, radii, shoulders, padding stay
+                    assert_eq!(
+                        NotchDimensions {
+                            width: home.width,
+                            height: home.height,
+                            ..d
+                        },
+                        home,
+                        "only width/height move (dpi {dpi})"
+                    );
+                }
+                let end = anim.current_dimensions(dpi);
+                assert_eq!(end.width, settled(dpi, to).width, "end width at {dpi}");
+                assert_eq!(end.height, settled(dpi, to).height, "end height at {dpi}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_rapid_space_switching_ends_exactly_at_the_last_target() {
+        for dpi in [96u32, 120, 137, 144, 168, 192, 288] {
+            let mut anim = AnimationState::space(HOME, MUSIC, scene(), scene());
+            for target in [HOME, MUSIC, CLIPBOARD, HOME, MUSIC] {
+                anim.run_for(60.0);
+                anim.retarget(NotchState::Expanded, target);
+            }
+            anim.set_progress(1.0);
+            assert_eq!(
+                anim.current_dimensions(dpi).width,
+                settled(dpi, MUSIC).width
+            );
+            assert_eq!(
+                anim.current_dimensions(dpi).height,
+                settled(dpi, MUSIC).height
+            );
+        }
+    }
+
+    #[test]
+    fn test_space_transition_can_reverse_into_collapse() {
+        let mut anim = AnimationState::space(HOME, MUSIC, scene(), scene());
+        anim.run_for(130.0);
+        let pos = anim.pos;
+        anim.retarget(NotchState::Collapsed, MUSIC);
+        assert_eq!(anim.target_state, NotchState::Collapsed);
+        assert_eq!(anim.pos, pos, "continues from the current size");
+        assert!(!anim.is_space_transition());
+        anim.set_progress(1.0);
+        let collapsed = NotchDimensions::from_state_and_dpi(NotchState::Collapsed, 120);
+        assert_eq!(anim.current_dimensions(120).height, collapsed.height);
+        assert_eq!(anim.current_dimensions(120).width, collapsed.width);
+    }
+
+    #[test]
+    fn test_expand_opens_at_the_space_size() {
+        for size in SPACES {
+            let mut anim = AnimationState::start(
+                NotchState::Collapsed,
+                (0.0, 0.0),
+                NotchState::Expanded,
+                size,
+                scene(),
+            );
+            assert_eq!(anim.motion, Motion::Expand);
+            anim.set_progress(1.0);
+            let end = anim.current_dimensions(120);
+            assert_eq!(end.width, settled(120, size).width);
+            assert_eq!(end.height, settled(120, size).height);
+            assert_eq!(
+                end,
+                settled(120, size),
+                "settles exactly on the settled dims"
+            );
         }
     }
 }

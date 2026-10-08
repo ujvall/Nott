@@ -477,6 +477,12 @@ impl Visualizer {
         self.level
     }
 
+    /// Jumps the fade to its target (used when no visualizer is on screen, so a
+    /// later reveal never shows a stale fade).
+    pub fn settle(&mut self) {
+        self.level = if self.playing { 1.0 } else { 0.0 };
+    }
+
     /// Advances the fade; returns `is_active()`.
     pub fn step(&mut self, dt_ms: f32) -> bool {
         let d = dt_ms / VISUALIZER_FADE_MS;
@@ -708,6 +714,8 @@ impl MediaControl {
 /// hover fades in/out over `MEDIA_HOVER_FADE_MS`; press applies instantly on
 /// mouse-down and eases back over `MEDIA_PRESS_RELEASE_MS` on release. Driven by
 /// `step(dt)` only while `is_animating()`; idle costs nothing.
+use crate::layout::ClipboardHit;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ControlFeedback {
     hovered: Option<MediaControl>,
@@ -720,6 +728,14 @@ pub struct ControlFeedback {
     /// New-track fade progress, 0..=1 (1 = settled). One timeline for the
     /// whole track content, not per field.
     track_fade: f32,
+    /// Clipboard space icon buttons (row copy/trash, header X): the same
+    /// hover/press easing, kept only for buttons that are targeted or still
+    /// easing back (hover, press levels).
+    clip_hovered: Option<ClipboardHit>,
+    clip_pressed: Option<ClipboardHit>,
+    /// Row under the pointer: its `Row(i)` hover level fades its buttons in.
+    clip_row: Option<usize>,
+    clip: Vec<(ClipboardHit, f32, f32)>,
 }
 
 impl Default for ControlFeedback {
@@ -731,6 +747,10 @@ impl Default for ControlFeedback {
             press: [0.0; 3],
             tap: [false; 3],
             track_fade: 1.0,
+            clip_hovered: None,
+            clip_pressed: None,
+            clip_row: None,
+            clip: Vec::new(),
         }
     }
 }
@@ -786,7 +806,65 @@ impl ControlFeedback {
     }
 
     pub fn is_animating(&self) -> bool {
-        self.track_fade < 1.0 || (0..3).any(|i| self.targets(i) != (self.hover[i], self.press[i]))
+        self.track_fade < 1.0
+            || (0..3).any(|i| self.targets(i) != (self.hover[i], self.press[i]))
+            || self
+                .clip
+                .iter()
+                .any(|&(b, h, p)| self.clip_targets(b) != (h, p))
+            || self
+                .clip_targeted()
+                .into_iter()
+                .flatten()
+                .any(|b| !self.clip.iter().any(|e| e.0 == b))
+    }
+
+    /// Hovered clipboard icon button; true if it changed.
+    pub fn set_clip_hovered(&mut self, button: Option<ClipboardHit>) -> bool {
+        std::mem::replace(&mut self.clip_hovered, button) != button
+    }
+
+    /// Row under the pointer (its copy / trash buttons fade in); true if it
+    /// changed.
+    pub fn set_clip_row(&mut self, row: Option<usize>) -> bool {
+        std::mem::replace(&mut self.clip_row, row) != row
+    }
+
+    /// Everything currently targeted: hovered button, pressed button, hovered row.
+    fn clip_targeted(&self) -> [Option<ClipboardHit>; 3] {
+        [
+            self.clip_hovered,
+            self.clip_pressed,
+            self.clip_row.map(ClipboardHit::Row),
+        ]
+    }
+
+    /// Mouse-down on a clipboard icon button.
+    pub fn press_clip(&mut self, button: ClipboardHit) {
+        self.clip_pressed = Some(button);
+    }
+
+    /// Mouse-up: the button eases back (returns whether one was pressed).
+    pub fn release_clip(&mut self) -> bool {
+        self.clip_pressed.take().is_some()
+    }
+
+    /// (hover, press) levels of a clipboard icon button.
+    pub fn clip_levels(&self, button: ClipboardHit) -> (f32, f32) {
+        self.clip
+            .iter()
+            .find(|e| e.0 == button)
+            .map_or((0.0, 0.0), |e| (e.1, e.2))
+    }
+
+    fn clip_targets(&self, button: ClipboardHit) -> (f32, f32) {
+        (
+            f32::from(u8::from(
+                self.clip_hovered == Some(button)
+                    || self.clip_row.map(ClipboardHit::Row) == Some(button),
+            )),
+            f32::from(u8::from(self.clip_pressed == Some(button))),
+        )
     }
 
     /// Restarts the new-track fade (content was already swapped atomically).
@@ -830,6 +908,24 @@ impl ControlFeedback {
             }
         }
         self.track_fade = approach(self.track_fade, 1.0, MEDIA_TRACK_FADE_MS);
+        let targeted = self.clip_targeted();
+        for b in targeted.into_iter().flatten() {
+            if !self.clip.iter().any(|e| e.0 == b) {
+                self.clip.push((b, 0.0, 0.0));
+            }
+        }
+        let targets: Vec<_> = self.clip.iter().map(|e| self.clip_targets(e.0)).collect();
+        for (e, (hover_t, press_t)) in self.clip.iter_mut().zip(targets) {
+            e.1 = approach(e.1, hover_t, MEDIA_HOVER_FADE_MS);
+            let press_ms = if press_t > e.2 {
+                MEDIA_PRESS_IN_MS
+            } else {
+                MEDIA_PRESS_RELEASE_MS
+            };
+            e.2 = approach(e.2, press_t, press_ms);
+        }
+        self.clip
+            .retain(|e| e.1 > 0.0 || e.2 > 0.0 || targeted.contains(&Some(e.0)));
         self.is_animating()
     }
 
@@ -2332,6 +2428,51 @@ mod tests {
     }
 
     #[test]
+    fn test_clipboard_buttons_grow_and_settle_back() {
+        use crate::layout::ClipboardHit;
+        let mut f = ControlFeedback::default();
+        let trash = ClipboardHit::Remove(1);
+        assert!(!f.is_animating(), "idle costs nothing");
+        assert!(f.set_clip_hovered(Some(trash)) && f.is_animating());
+        f.step(30.0);
+        let (h1, _) = f.clip_levels(trash);
+        assert!(h1 > 0.0 && h1 < 1.0, "eases in, not a jump: {h1}");
+        while f.step(16.0) {}
+        assert_eq!(f.clip_levels(trash), (1.0, 0.0), "fully hovered");
+        f.press_clip(trash);
+        while f.step(16.0) {}
+        assert_eq!(f.clip_levels(trash), (1.0, 1.0), "pressed on top of hover");
+        assert!(f.release_clip() && !f.release_clip());
+        f.set_clip_hovered(None);
+        f.step(30.0);
+        let (h2, p2) = f.clip_levels(trash);
+        assert!(h2 < 1.0 && p2 < 1.0 && (h2 > 0.0 || p2 > 0.0), "eases back");
+        while f.step(16.0) {}
+        assert_eq!(f.clip_levels(trash), (0.0, 0.0));
+        assert!(f.clip.is_empty(), "settled buttons are dropped");
+        // Other buttons are independent
+        f.set_clip_hovered(Some(ClipboardHit::Copy(0)));
+        while f.step(16.0) {}
+        assert_eq!(f.clip_levels(trash), (0.0, 0.0));
+        assert_eq!(f.clip_levels(ClipboardHit::Copy(0)).0, 1.0);
+        // The hovered row fades in; moving to the next row fades the first out
+        f.set_clip_hovered(None);
+        f.set_clip_row(Some(0));
+        while f.step(16.0) {}
+        assert_eq!(f.clip_levels(ClipboardHit::Row(0)).0, 1.0);
+        assert!(f.set_clip_row(Some(1)));
+        while f.step(16.0) {}
+        assert_eq!(
+            f.clip_levels(ClipboardHit::Row(0)).0,
+            0.0,
+            "previous row hidden"
+        );
+        assert_eq!(f.clip_levels(ClipboardHit::Row(1)).0, 1.0);
+        f.reset();
+        assert!(f.clip.is_empty() && !f.is_animating());
+    }
+
+    #[test]
     fn test_feedback_reset_clears_everything() {
         let mut f = ControlFeedback::default();
         f.set_hovered(Some(MediaControl::Previous));
@@ -2902,5 +3043,21 @@ mod tests {
             hidden.bar_heights(3.7),
             [VISUALIZER_MIN_HEIGHT; VISUALIZER_BARS]
         );
+    }
+
+    #[test]
+    fn test_visualizer_settle_skips_hidden_fades() {
+        let mut v = Visualizer::default();
+        v.set_playing(true);
+        v.settle();
+        assert_eq!(v.level(), 1.0, "playing while off screen: shown at full");
+        v.set_playing(false);
+        v.settle();
+        assert_eq!(
+            v.level(),
+            0.0,
+            "paused while off screen: no stale fade later"
+        );
+        assert!(!v.is_active());
     }
 }

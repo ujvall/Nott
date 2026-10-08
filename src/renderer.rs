@@ -28,27 +28,50 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::WindowsAndMessaging::{ULW_ALPHA, UpdateLayeredWindow};
 use windows::core::{Error, Result};
 
+use crate::clipboard::{ClipboardHistory, ClipboardItem};
 use crate::clock::ClockDateState;
+use crate::config::Transition;
+use crate::config::{
+    BASE_CLIPBOARD_ROW_PAD, BASE_CLIPBOARD_ROW_RADIUS, BASE_CLIPBOARD_THUMB_INSET,
+    BASE_CLIPBOARD_THUMB_RADIUS, CLIPBOARD_PREVIEW_CHARS, CLIPBOARD_VISIBLE_ROWS,
+    COLOR_CLIPBOARD_ROW,
+};
+use crate::config::{
+    BASE_DROP_ICON_SIZE, BASE_DROP_OUTLINE_INSET, BASE_DROP_OUTLINE_RADIUS,
+    BASE_DROP_OUTLINE_WIDTH, COLOR_DROP_ICON, COLOR_DROP_OUTLINE, DROP_OUTLINE_DASHES,
+};
 use crate::config::{
     BASE_MEDIA_ARTIST_FONT_SIZE, BASE_MEDIA_ARTWORK_RADIUS_EXTRA, BASE_MEDIA_BADGE_OVERHANG,
     BASE_MEDIA_BADGE_RING, BASE_MEDIA_BADGE_SIZE, BASE_MEDIA_DATE_FONT_SIZE, BASE_MEDIA_ICON_SIZE,
     BASE_MEDIA_PLAY_ICON_SIZE, BASE_MEDIA_SOURCE_FONT_SIZE, BASE_MEDIA_TIME_FONT_SIZE,
     BASE_MEDIA_TIMELINE_FONT_SIZE, BASE_MEDIA_TIMELINE_LABEL_GAP, BASE_MEDIA_TIMELINE_LABEL_WIDTH,
     BASE_MEDIA_TIMELINE_MIN_TRACK, BASE_MEDIA_TIMELINE_TRACK, BASE_MEDIA_TITLE_FONT_SIZE,
-    COLOR_ARTWORK_HAIRLINE, COLOR_BORDER_HOVER, COLOR_MEDIA_CONTROL_HOVER,
-    COLOR_MEDIA_TRACK_UNPLAYED, COLOR_TEXT_PRIMARY, COLOR_TEXT_SECONDARY, COLOR_TEXT_TERTIARY,
-    COLOR_TRANSPARENT, CornerProfile, FONT_FAMILY_DISPLAY, FONT_FAMILY_FALLBACK,
-    FONT_FAMILY_PRIMARY, MEDIA_CONTROL_PRESS_ALPHA, MEDIA_ICON_REST_OPACITY,
+    BASE_MUSIC_ARTWORK_RADIUS, BASE_MUSIC_ICON_SIZE, BASE_MUSIC_PLAY_ICON_SIZE,
+    BASE_SPACE_ICON_SIZE, COLOR_ARTWORK_HAIRLINE, COLOR_BORDER_HOVER, COLOR_MEDIA_DIVIDER,
+    COLOR_MEDIA_TRACK_UNPLAYED, COLOR_SPACE_PILL_SELECTED, COLOR_TEXT_PRIMARY,
+    COLOR_TEXT_SECONDARY, COLOR_TEXT_TERTIARY, COLOR_TRANSPARENT, CornerProfile,
+    FONT_FAMILY_DISPLAY, FONT_FAMILY_FALLBACK, FONT_FAMILY_PRIMARY, MEDIA_ICON_REST_OPACITY,
     MEDIA_PRESS_ICON_SCALE, NOTCH_BG_COLOR, NOTCH_BORDER_COLOR, NotchDimensions,
     SKIP_GLYPH_HALF_WIDTH,
 };
+#[cfg(test)]
+use crate::layout::resolve_media_layout;
+use crate::layout::{
+    ClipboardHit, ClipboardLayout, blended_selector, resolve_clipboard_layout, space_dimensions,
+};
 use crate::layout::{
     CollapsedLayout, ExpandedLayout, MediaLayout, RectF, ResolvedLayout, resolve_collapsed_layout,
-    resolve_layout, resolve_media_layout, visualizer_metrics,
+    resolve_layout, resolve_media_layout_in, visualizer_metrics,
 };
 use crate::media::{
     Artwork, ControlFeedback, MediaContent, MediaControl, PlayPauseIcon, Visualizer, format_clock,
     now_filetime, shows_visualizer,
+};
+use crate::space::NottSpace;
+use crate::space::Scene;
+use windows::Win32::Graphics::Direct2D::{
+    D2D1_CAP_STYLE_ROUND, D2D1_DASH_STYLE_CUSTOM, D2D1_LAYER_PARAMETERS, D2D1_LINE_JOIN_ROUND,
+    D2D1_STROKE_STYLE_PROPERTIES, ID2D1StrokeStyle,
 };
 
 #[repr(C)]
@@ -164,7 +187,40 @@ pub struct Renderer {
     visualizer: RefCell<Visualizer>,
     /// Time origin of the visualizer motion.
     epoch: std::time::Instant,
+    /// Active space shown by the selector (mirrors `WindowState.space`, which
+    /// sets it on every switch).
+    space: Cell<NottSpace>,
+    /// An image drag is over the notch: the expanded notch shows the drop page.
+    drop_page: Cell<bool>,
+    /// The running animation's content blend and opacity (None when settled).
+    transition: Cell<Option<Transition>>,
+    /// Round-capped dashes of the drop page outline (device independent).
+    drop_stroke: ID2D1StrokeStyle,
+    /// Solid round caps and joins (the outline copy icon).
+    round_stroke: ID2D1StrokeStyle,
+    /// Clipboard space rows, rebuilt only when the history changes.
+    clipboard: RefCell<ClipboardView>,
+    /// Device bitmaps of the shown clipboard thumbnails, keyed by (image, pixel
+    /// size); tied to `cached_rt`, pruned to the visible rows on every change.
+    thumbs: RefCell<Vec<(Artwork, u32, ID2D1Bitmap)>>,
 }
+
+/// What the Clipboard space shows, UTF-16 encoded once per history change.
+#[derive(Default)]
+struct ClipboardView {
+    /// The newest entries (at most `CLIPBOARD_VISIBLE_ROWS`).
+    rows: Vec<ClipRow>,
+}
+
+enum ClipRow {
+    /// One-line, bounded preview.
+    Text(Vec<u16>),
+    /// The entry's image (shared pixels) and its "Image · W × H" caption.
+    Image(Artwork, Vec<u16>),
+}
+
+/// Clipboard space empty state.
+const CLIPBOARD_EMPTY_LABEL: &str = "Copied text and images appear here";
 
 struct MediaText {
     content: MediaContent,
@@ -179,10 +235,17 @@ struct MediaFormats {
     source: IDWriteTextFormat,
     time: IDWriteTextFormat,
     date: IDWriteTextFormat,
-    /// Scrubber labels: elapsed (right-aligned to the track) and remaining
+    /// Scrubber labels hugging the strip's edges: elapsed (leading) and
+    /// remaining (trailing), aligned with the cover and visualizer edges
     elapsed: IDWriteTextFormat,
     remaining: IDWriteTextFormat,
+    /// Space selector labels (centered in their capsules)
+    /// Music space without a session (centered)
+    empty: IDWriteTextFormat,
 }
+
+/// Music space empty state (no media session): a quiet label, never metadata.
+const MUSIC_EMPTY_LABEL: &str = "Nothing playing";
 
 /// Accent of the shown media (artwork-derived), or the neutral UI accent.
 fn accent_color(content: Option<&MediaContent>) -> D2D1_COLOR_F {
@@ -232,6 +295,71 @@ fn resample_area(src: &Artwork, px: u32) -> Artwork {
         }
     }
     Artwork::new(d as u32, d as u32, out).unwrap_or_else(|| src.clone())
+}
+
+/// Opacity of a blended scene part at weight `w` (0..1): smoothstep over
+/// 0.4..0.9, so an outgoing part is gone before the incoming one is fully in,
+/// and swapping from/to with `1 - w` gives the same value (reversals are seamless).
+fn scene_fade(w: f32) -> f32 {
+    smoothstep(0.4, 0.9, w)
+}
+
+/// 0 below `a`, 1 above `b`, eased in between.
+fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
+    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// The space whose notch size the drop page always takes, whichever is active.
+pub const DROP_PAGE_SPACE: NottSpace = NottSpace::Clipboard;
+
+/// Settled drop page dimensions at a DPI.
+fn drop_page_dimensions(dpi: u32) -> NotchDimensions {
+    crate::layout::space_dimensions(crate::config::NotchState::Expanded, dpi, DROP_PAGE_SPACE)
+}
+
+/// Clipboard thumbnail: the centre square of `src` (cover crop, aspect kept),
+/// area-resampled to `px` x `px`, with corners rounded to `radius` pixels by
+/// scaling the premultiplied pixels with their coverage. Built from the
+/// entry's existing pixels: nothing is decoded.
+fn thumbnail(src: &Artwork, px: u32, radius: f32) -> Artwork {
+    let side = src.width.min(src.height);
+    let (x0, y0) = (
+        (src.width - side) as usize / 2,
+        (src.height - side) as usize / 2,
+    );
+    let (w, n) = (src.width as usize, side as usize);
+    let mut square = Vec::with_capacity(n * n * 4);
+    for y in y0..y0 + n {
+        let start = (y * w + x0) * 4;
+        square.extend_from_slice(&src.pixels[start..start + n * 4]);
+    }
+    let Some(square) = Artwork::new(side, side, square) else {
+        return src.clone();
+    };
+    let thumb = resample_area(&square, px);
+    let d = thumb.width as f32;
+    let r = radius.clamp(0.0, d / 2.0);
+    let mut pixels = thumb.pixels.to_vec();
+    for (i, pixel) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        let (x, y) = (
+            (i as u32 % thumb.width) as f32 + 0.5,
+            (i as u32 / thumb.width) as f32 + 0.5,
+        );
+        let (cx, cy) = (x.clamp(r, d - r), y.clamp(r, d - r));
+        let dist = (x - cx).hypot(y - cy);
+        let cover = if dist == 0.0 {
+            1.0
+        } else {
+            (r - dist + 0.5).clamp(0.0, 1.0)
+        };
+        if cover < 1.0 {
+            for c in pixel.iter_mut() {
+                *c = (f32::from(*c) * cover).round() as u8;
+            }
+        }
+    }
+    Artwork::new(thumb.width, thumb.height, pixels).unwrap_or(thumb)
 }
 
 /// Skip glyph height (fraction of the icon size).
@@ -429,6 +557,80 @@ impl Renderer {
         changed
     }
 
+    /// Sets the space the selector shows; true if it changed (caller redraws).
+    pub fn set_space(&self, space: NottSpace) -> bool {
+        self.space.replace(space) != space
+    }
+
+    /// The animation frame's content blend / opacity (None: settled).
+    pub fn set_transition(&self, transition: Option<Transition>) {
+        self.transition.set(transition);
+    }
+
+    /// What this frame shows: the transition, or the settled scene at full
+    /// opacity.
+    fn scene_view(&self) -> Transition {
+        self.transition.get().unwrap_or_else(|| {
+            let scene = if self.drop_page.get() {
+                Scene::Drop
+            } else {
+                Scene::Space(self.space.get())
+            };
+            Transition {
+                from: scene,
+                to: scene,
+                mix: 1.0,
+                alpha: 1.0,
+            }
+        })
+    }
+
+    /// The space a scene belongs to (the drop page sits over the active one).
+    fn space_of(&self, scene: Scene) -> NottSpace {
+        match scene {
+            Scene::Space(space) => space,
+            Scene::Drop => self.space.get(),
+        }
+    }
+
+    /// Whether the drop page is showing (the window sizes the notch for it).
+    pub fn drop_page(&self) -> bool {
+        self.drop_page.get()
+    }
+
+    /// Shows/hides the drop page; true if it changed (caller redraws).
+    pub fn set_drop_page(&self, on: bool) -> bool {
+        self.drop_page.replace(on) != on
+    }
+
+    /// Rebuilds the Clipboard space rows from the history (call on every
+    /// history change; the caller redraws if the space is visible). Thumbnails
+    /// of entries no longer shown are released.
+    pub fn set_clipboard(&self, history: &ClipboardHistory) {
+        let rows: Vec<ClipRow> = history
+            .items()
+            .take(CLIPBOARD_VISIBLE_ROWS)
+            .map(|item| match item {
+                ClipboardItem::Text(t) => ClipRow::Text(
+                    crate::clipboard::preview(t, CLIPBOARD_PREVIEW_CHARS)
+                        .encode_utf16()
+                        .collect(),
+                ),
+                ClipboardItem::Image(a) => ClipRow::Image(
+                    a.clone(),
+                    format!("Image \u{00B7} {} \u{00D7} {}", a.width, a.height)
+                        .encode_utf16()
+                        .collect(),
+                ),
+            })
+            .collect();
+        self.thumbs.borrow_mut().retain(|(a, _, _)| {
+            rows.iter()
+                .any(|r| matches!(r, ClipRow::Image(b, _) if b == a))
+        });
+        *self.clipboard.borrow_mut() = ClipboardView { rows };
+    }
+
     /// Playback visualizer state (window drives `step` while it is active).
     pub fn visualizer(&self) -> std::cell::RefMut<'_, Visualizer> {
         self.visualizer.borrow_mut()
@@ -452,6 +654,33 @@ impl Renderer {
             unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)? };
         let dwrite_factory: IDWriteFactory =
             unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
+        let round_stroke = unsafe {
+            d2d_factory.CreateStrokeStyle(
+                &D2D1_STROKE_STYLE_PROPERTIES {
+                    startCap: D2D1_CAP_STYLE_ROUND,
+                    endCap: D2D1_CAP_STYLE_ROUND,
+                    dashCap: D2D1_CAP_STYLE_ROUND,
+                    lineJoin: D2D1_LINE_JOIN_ROUND,
+                    miterLimit: 1.0,
+                    ..Default::default()
+                },
+                None,
+            )?
+        };
+        let drop_stroke = unsafe {
+            d2d_factory.CreateStrokeStyle(
+                &D2D1_STROKE_STYLE_PROPERTIES {
+                    startCap: D2D1_CAP_STYLE_ROUND,
+                    endCap: D2D1_CAP_STYLE_ROUND,
+                    dashCap: D2D1_CAP_STYLE_ROUND,
+                    lineJoin: D2D1_LINE_JOIN_ROUND,
+                    miterLimit: 1.0,
+                    dashStyle: D2D1_DASH_STYLE_CUSTOM,
+                    dashOffset: 0.0,
+                },
+                Some(&DROP_OUTLINE_DASHES),
+            )?
+        };
         Ok(Self {
             d2d_factory,
             dwrite_factory,
@@ -474,6 +703,13 @@ impl Renderer {
             clock_format: RefCell::new(None),
             visualizer: RefCell::new(Visualizer::default()),
             epoch: std::time::Instant::now(),
+            space: Cell::new(NottSpace::default()),
+            clipboard: RefCell::new(ClipboardView::default()),
+            round_stroke,
+            thumbs: RefCell::new(Vec::new()),
+            drop_page: Cell::new(false),
+            transition: Cell::new(None),
+            drop_stroke,
         })
     }
 
@@ -483,6 +719,7 @@ impl Renderer {
             // Device bitmaps belong to the render target being released
             *self.art_bitmap.borrow_mut() = None;
             *self.badge_bitmap.borrow_mut() = None;
+            self.thumbs.borrow_mut().clear();
             *self.cached_rt.borrow_mut() = None;
             let mem_dc = self.cached_mem_dc.get();
             if !mem_dc.is_invalid() {
@@ -1236,10 +1473,657 @@ impl Renderer {
             );
         }
         let accent = accent_color(self.media.borrow().as_ref().map(|m| &m.content));
-        self.draw_visualizer(rt, layout.visualizer_bounds, accent, dimensions.scale)?;
+        self.draw_visualizer(rt, layout.visualizer_bounds, accent, dimensions.scale, 1.0)?;
         unsafe { rt.PopAxisAlignedClip() };
 
         Ok(())
+    }
+
+    /// Space selector: two capsules above the expanded content. The active space
+    /// gets a quiet filled capsule and primary text; the other is text only.
+    /// The active space's selector laid out on `dimensions` as they are.
+    #[cfg(test)]
+    fn draw_space_selector(
+        &self,
+        rt: &ID2D1RenderTarget,
+        dimensions: &NotchDimensions,
+    ) -> Result<()> {
+        let active = self.space.get();
+        let Some(selector) = crate::layout::resolve_space_selector_in(dimensions, active) else {
+            return Ok(());
+        };
+        self.paint_selector(rt, dimensions, &selector, selector.bounds(active), 1.0)
+    }
+
+    /// The selector between two spaces (see `blended_selector`): pills glide,
+    /// the highlight slides from the outgoing to the incoming space's pill.
+    fn draw_selector_blended(
+        &self,
+        rt: &ID2D1RenderTarget,
+        dimensions: &NotchDimensions,
+        from: NottSpace,
+        to: NottSpace,
+        mix: f32,
+        alpha: f32,
+    ) -> Result<()> {
+        let Some((selector, highlight)) = blended_selector(dimensions, from, to, mix) else {
+            return Ok(());
+        };
+        self.paint_selector(rt, dimensions, &selector, highlight, alpha)
+    }
+
+    /// Pills (white solid icons) with the highlight capsule behind one place.
+    fn paint_selector(
+        &self,
+        rt: &ID2D1RenderTarget,
+        dimensions: &NotchDimensions,
+        selector: &crate::layout::SpaceSelectorLayout,
+        highlight: RectF,
+        alpha: f32,
+    ) -> Result<()> {
+        let s = dimensions.scale;
+        let u = (BASE_SPACE_ICON_SIZE * s).round();
+        unsafe {
+            let fill = rt.CreateSolidColorBrush(&COLOR_SPACE_PILL_SELECTED, None)?;
+            fill.SetOpacity(alpha);
+            rt.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: highlight.to_d2d_rect(),
+                    radiusX: highlight.height() / 2.0,
+                    radiusY: highlight.height() / 2.0,
+                },
+                &fill,
+            );
+            let white = rt.CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 1.0,
+                },
+                None,
+            )?;
+            white.SetOpacity(alpha);
+            for space in NottSpace::ALL {
+                let r = selector.bounds(space);
+                // White glyphs; the active space is marked by its pill
+                let brush = &white;
+                let (cx, cy) = ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
+                self.draw_space_icon(rt, space, cx, cy, u, brush)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Space icons (Flaticon UIcons solid-rounded, see `HOUSE_BLANK` /
+    /// `MUSIC_ALT`), filled in a `u`-sized box centred on (cx, cy).
+    fn draw_space_icon(
+        &self,
+        rt: &ID2D1RenderTarget,
+        space: NottSpace,
+        cx: f32,
+        cy: f32,
+        u: f32,
+        brush: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
+    ) -> Result<()> {
+        let segments = match space {
+            NottSpace::Home => HOUSE_BLANK,
+            NottSpace::Music => MUSIC_ALT,
+            NottSpace::Clipboard => CLIPBOARD,
+        };
+        self.draw_glyph(rt, segments, cx, cy, u, brush)
+    }
+
+    /// Fills a UIcons glyph (`IconSeg` path) in a `u`-sized box centred on (cx, cy).
+    fn draw_glyph(
+        &self,
+        rt: &ID2D1RenderTarget,
+        segments: &[IconSeg],
+        cx: f32,
+        cy: f32,
+        u: f32,
+        brush: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
+    ) -> Result<()> {
+        let p = |x: f32, y: f32| D2D_POINT_2F {
+            x: cx + x * u,
+            y: cy + y * u,
+        };
+        let path = unsafe { self.d2d_factory.CreatePathGeometry()? };
+        let sink = unsafe { path.Open()? };
+        let helper =
+            unsafe { GeometrySinkHelper::from_raw(windows::core::Interface::as_raw(&sink)) };
+        unsafe {
+            for seg in segments {
+                match *seg {
+                    IconSeg::M(x, y) => helper.begin_figure(p(x, y)),
+                    IconSeg::L(x, y) => helper.add_line(p(x, y)),
+                    IconSeg::C(x1, y1, x2, y2, x, y) => helper.add_bezier(&D2D1_BEZIER_SEGMENT {
+                        point1: p(x1, y1),
+                        point2: p(x2, y2),
+                        point3: p(x, y),
+                    }),
+                    IconSeg::Z => helper.end_figure(),
+                }
+            }
+            helper.close()?;
+            rt.FillGeometry(&path, brush, None);
+        }
+        Ok(())
+    }
+
+    /// Music space without a media session: a single quiet centered label (no
+    /// stale artwork/text/accent can show: there is no media content at all).
+    fn draw_music_empty(
+        &self,
+        rt: &ID2D1RenderTarget,
+        layout: &ExpandedLayout,
+        dimensions: &NotchDimensions,
+    ) -> Result<()> {
+        let formats = self.media_formats(dimensions)?;
+        let text: Vec<u16> = MUSIC_EMPTY_LABEL.encode_utf16().collect();
+        unsafe {
+            let brush = rt.CreateSolidColorBrush(&COLOR_TEXT_TERTIARY, None)?;
+            rt.DrawText(
+                &text,
+                &formats.empty,
+                &layout.content_bounds.to_d2d_rect(),
+                &brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+        Ok(())
+    }
+
+    /// Drop page, a fresh surface while an image is dragged over the notch: a
+    /// rounded dashed outline inset from the notch body (same corner profile as
+    /// the notch) with the inbox glyph centred in it. Nothing else is drawn.
+    /// The page is always laid out for its one universal size (the Clipboard
+    /// notch) and clipped to the current silhouette, so while the notch opens
+    /// or resizes it is revealed in place: the dashes never re-flow or crawl.
+    fn draw_drop_page(&self, rt: &ID2D1RenderTarget, dimensions: &NotchDimensions) -> Result<()> {
+        let target = drop_page_dimensions(dimensions.dpi);
+        let px = |v: f32| (v * target.scale).round();
+        let wall = target.shadow_margin_x + target.curvature.top_transition_radius;
+        let inset = px(BASE_DROP_OUTLINE_INSET);
+        let width = px(BASE_DROP_OUTLINE_WIDTH).max(1.0);
+        // Both windows are centred on the screen: align the page's centre
+        let dx = ((dimensions.width - target.width) as f32 / 2.0).round();
+        // Stroke centred half a width inside the outline box
+        let half = width / 2.0;
+        let outline = RectF::new(
+            dx + wall + inset + half,
+            inset + half,
+            dx + target.width as f32 - wall - inset - half,
+            target.height as f32 - target.shadow_margin_bottom - inset - half,
+        );
+        if outline.width() <= 0.0 || outline.height() <= 0.0 {
+            return Ok(());
+        }
+        let profile = CornerProfile::new(
+            px(BASE_DROP_OUTLINE_RADIUS),
+            1.0,
+            outline.width().min(outline.height()) / 2.0,
+        );
+        let path = self.smooth_rect_path(outline, profile.span, profile.handle)?;
+        let silhouette = self.create_notch_geometry(dimensions)?;
+        self.with_layer(rt, Some(&silhouette), 1.0, || unsafe {
+            let dashes = rt.CreateSolidColorBrush(&COLOR_DROP_OUTLINE, None)?;
+            rt.DrawGeometry(&path, &dashes, width, &self.drop_stroke);
+            let icon = rt.CreateSolidColorBrush(&COLOR_DROP_ICON, None)?;
+            let (cx, cy) = (
+                (outline.left + outline.right) / 2.0,
+                (outline.top + outline.bottom) / 2.0,
+            );
+            self.draw_glyph(rt, INBOX, cx, cy, px(BASE_DROP_ICON_SIZE), &icon)
+        })
+    }
+
+    /// Runs `draw` inside a layer clipped to `mask` (if any) at `opacity`.
+    /// Without a mask at full opacity it draws directly (settled frames).
+    fn with_layer(
+        &self,
+        rt: &ID2D1RenderTarget,
+        mask: Option<&ID2D1PathGeometry>,
+        opacity: f32,
+        draw: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        if mask.is_none() && opacity >= 1.0 {
+            return draw();
+        }
+        let mut layer = D2D1_LAYER_PARAMETERS {
+            contentBounds: windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F {
+                left: -f32::MAX,
+                top: -f32::MAX,
+                right: f32::MAX,
+                bottom: f32::MAX,
+            },
+            geometricMask: std::mem::ManuallyDrop::new(match mask {
+                Some(m) => Some(windows::core::Interface::cast(m)?),
+                None => None,
+            }),
+            maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            opacity: opacity.clamp(0.0, 1.0),
+            ..Default::default()
+        };
+        // Identity mask transform
+        layer.maskTransform.M11 = 1.0;
+        layer.maskTransform.M22 = 1.0;
+        unsafe {
+            rt.PushLayer(
+                &layer,
+                None::<&windows::Win32::Graphics::Direct2D::ID2D1Layer>,
+            );
+        }
+        let drawn = draw();
+        unsafe { rt.PopLayer() };
+        // Release the mask reference the layer parameters hold
+        drop(std::mem::ManuallyDrop::into_inner(layer.geometricMask));
+        drawn
+    }
+
+    /// Draws everything after this shifted right by `dx` (0 resets).
+    fn set_offset(rt: &ID2D1RenderTarget, dx: f32) {
+        let mut m = D2D1_LAYER_PARAMETERS::default().maskTransform;
+        m.M11 = 1.0;
+        m.M22 = 1.0;
+        m.M31 = dx;
+        unsafe { rt.SetTransform(&m) };
+    }
+
+    /// The expanded notch's content this frame. Settled: the active scene,
+    /// directly. Animating: clipped to the notch silhouette at the content
+    /// opacity; during a space change the outgoing and incoming scenes blend
+    /// (Home <-> Music with media morph as one composition, the rest
+    /// cross-fade). Every scene keeps its settled layout, centred in the
+    /// window, so the shell morphs around content instead of pushing it.
+    fn draw_expanded(
+        &self,
+        rt: &ID2D1RenderTarget,
+        dims: &NotchDimensions,
+        clock: &ClockDateState,
+    ) -> Result<()> {
+        let t = self.scene_view();
+        if t.alpha <= 0.0 {
+            return Ok(());
+        }
+        let blending = t.from != t.to;
+        let mask = if blending || t.alpha < 1.0 {
+            Some(self.create_notch_geometry(dims)?)
+        } else {
+            None
+        };
+        self.with_layer(rt, mask.as_ref(), t.alpha, || {
+            let weight = |s: Scene| {
+                if !blending {
+                    f32::from(u8::from(s == t.to))
+                } else if s == t.to {
+                    t.mix
+                } else if s == t.from {
+                    1.0 - t.mix
+                } else {
+                    0.0
+                }
+            };
+            let selector_alpha = 1.0 - weight(Scene::Drop);
+            if selector_alpha > 0.0 {
+                let mix = if blending { t.mix } else { 1.0 };
+                let (from, to) = (self.space_of(t.from), self.space_of(t.to));
+                self.draw_selector_blended(rt, dims, from, to, mix, selector_alpha)?;
+            }
+            if !blending {
+                return self.draw_scene(rt, dims, clock, t.to);
+            }
+            // Home <-> Music with a session: one composition morphing
+            if let (Scene::Space(a), Scene::Space(b)) = (t.from, t.to)
+                && a != NottSpace::Clipboard
+                && b != NottSpace::Clipboard
+                && self.media.borrow().is_some()
+            {
+                let music = if b == NottSpace::Music {
+                    t.mix
+                } else {
+                    1.0 - t.mix
+                };
+                return self.draw_media_morph(rt, dims, clock, music);
+            }
+            for (scene, w) in [(t.from, 1.0 - t.mix), (t.to, t.mix)] {
+                let a = scene_fade(w);
+                if a > 0.0 {
+                    self.with_layer(rt, None, a, || self.draw_scene(rt, dims, clock, scene))?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// One scene at its settled layout, centred in the current window.
+    fn draw_scene(
+        &self,
+        rt: &ID2D1RenderTarget,
+        dims: &NotchDimensions,
+        clock: &ClockDateState,
+        scene: Scene,
+    ) -> Result<()> {
+        let space = match scene {
+            Scene::Drop => return self.draw_drop_page(rt, dims),
+            Scene::Space(space) => space,
+        };
+        let settled = space_dimensions(crate::config::NotchState::Expanded, dims.dpi, space);
+        let ResolvedLayout::Expanded { components, .. } = resolve_layout(&settled) else {
+            return Ok(());
+        };
+        let dx = ((dims.width - settled.width) as f32 / 2.0).round();
+        if dx != 0.0 {
+            Self::set_offset(rt, dx);
+        }
+        let drawn = if space == NottSpace::Clipboard {
+            self.draw_clipboard(rt, &settled)
+        } else {
+            let media = self.media.borrow();
+            let composition = media.as_ref().and_then(|m| {
+                resolve_media_layout_in(&settled, m.content.shape(), space).map(|l| (m, l))
+            });
+            match composition {
+                Some((m, l)) => {
+                    let music = f32::from(u8::from(space == NottSpace::Music));
+                    self.render_media_blend(rt, &components, &l, &settled, clock, m, music)
+                }
+                None if space == NottSpace::Music => {
+                    self.draw_music_empty(rt, &components, &settled)
+                }
+                None => self.render_expanded_content(
+                    rt,
+                    &components,
+                    &settled,
+                    &clock.formatted_time,
+                    &clock.formatted_date,
+                ),
+            }
+        };
+        if dx != 0.0 {
+            Self::set_offset(rt, 0.0);
+        }
+        drawn
+    }
+
+    /// Home <-> Music with a session: cover, text and controls move between
+    /// their Home and Music places (each centred in the window); the clock
+    /// column and divider fade out as the scrubber and visualizer fade in.
+    fn draw_media_morph(
+        &self,
+        rt: &ID2D1RenderTarget,
+        dims: &NotchDimensions,
+        clock: &ClockDateState,
+        music: f32,
+    ) -> Result<()> {
+        let media = self.media.borrow();
+        let Some(m) = media.as_ref() else {
+            return Ok(());
+        };
+        let place = |space: NottSpace| {
+            let settled = space_dimensions(crate::config::NotchState::Expanded, dims.dpi, space);
+            let dx = ((dims.width - settled.width) as f32 / 2.0).round();
+            resolve_media_layout_in(&settled, m.content.shape(), space).map(|l| l.offset_x(dx))
+        };
+        let (Some(home), Some(player)) = (place(NottSpace::Home), place(NottSpace::Music)) else {
+            return Ok(());
+        };
+        let ResolvedLayout::Expanded { components, .. } = resolve_layout(dims) else {
+            return Ok(());
+        };
+        let blend = MediaLayout::morph(&home, &player, music);
+        self.render_media_blend(rt, &components, &blend, dims, clock, m, music)
+    }
+
+    /// Clipboard space: count label and Clear in the selector band, then the
+    /// newest entries as rows (text preview, or thumbnail + size), or the
+    /// empty state. Clipped to the notch body (rows ride the height transition).
+    fn draw_clipboard(&self, rt: &ID2D1RenderTarget, dimensions: &NotchDimensions) -> Result<()> {
+        let Some(l) = resolve_clipboard_layout(dimensions) else {
+            return Ok(());
+        };
+        let formats = self.media_formats(dimensions)?;
+        let view = self.clipboard.borrow();
+        let px = |v: f32| (v * dimensions.scale).round();
+        let body = RectF::new(
+            0.0,
+            0.0,
+            dimensions.width as f32,
+            dimensions.height as f32 - dimensions.shadow_margin_bottom,
+        );
+        // Icon buttons grow smoothly with their hover / press levels
+        let grow = |b: ClipboardHit| {
+            let (hover, press) = self.feedback.borrow().clip_levels(b);
+            1.0 + crate::config::CLIPBOARD_BUTTON_HOVER_GROW * hover
+                + crate::config::CLIPBOARD_BUTTON_PRESS_GROW * press
+        };
+        let center = |r: RectF| ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
+        unsafe {
+            let outline = rt.CreateSolidColorBrush(&COLOR_CLIPBOARD_ROW, None)?;
+            let outline_w = px(crate::config::BASE_CLIPBOARD_ROW_OUTLINE).max(1.0);
+            let primary = rt.CreateSolidColorBrush(&COLOR_TEXT_PRIMARY, None)?;
+            let secondary = rt.CreateSolidColorBrush(&COLOR_TEXT_SECONDARY, None)?;
+            let tertiary = rt.CreateSolidColorBrush(&COLOR_TEXT_TERTIARY, None)?;
+            let text = |s: &[u16], f: &IDWriteTextFormat, r: RectF, b| {
+                rt.DrawText(
+                    s,
+                    f,
+                    &r.to_d2d_rect(),
+                    b,
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                )
+            };
+            rt.PushAxisAlignedClip(&body.to_d2d_rect(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            let icon = px(crate::config::BASE_CLIPBOARD_ACTION_ICON_SIZE);
+            let mut drawn = Ok(());
+            if view.rows.is_empty() {
+                let empty: Vec<u16> = CLIPBOARD_EMPTY_LABEL.encode_utf16().collect();
+                text(&empty, &formats.empty, l.list, &tertiary);
+            } else {
+                let (cx, cy) = center(l.clear);
+                let u =
+                    px(crate::config::BASE_CLIPBOARD_CLEAR_ICON_SIZE) * grow(ClipboardHit::Clear);
+                if let Err(e) = self.draw_cross(rt, cx, cy, u, &secondary) {
+                    drawn = Err(e);
+                }
+            }
+            let (pad, inset) = (px(BASE_CLIPBOARD_ROW_PAD), px(BASE_CLIPBOARD_THUMB_INSET));
+            for (i, (row, r)) in view.rows.iter().zip(l.rows).enumerate() {
+                // Full-width outlined box; its copy / trash buttons fade in only
+                // while the row is hovered (one row at a time)
+                let (entry, copy, trash) = ClipboardLayout::row_parts(r);
+                let shown = self.feedback.borrow().clip_levels(ClipboardHit::Row(i)).0;
+                let half = outline_w / 2.0;
+                rt.DrawRoundedRectangle(
+                    &D2D1_ROUNDED_RECT {
+                        rect: RectF::new(
+                            entry.left + half,
+                            entry.top + half,
+                            entry.right - half,
+                            entry.bottom - half,
+                        )
+                        .to_d2d_rect(),
+                        radiusX: px(BASE_CLIPBOARD_ROW_RADIUS),
+                        radiusY: px(BASE_CLIPBOARD_ROW_RADIUS),
+                    },
+                    &outline,
+                    outline_w,
+                    None,
+                );
+                if shown > 0.0 {
+                    secondary.SetOpacity(shown);
+                    let (cx, cy) = center(copy);
+                    let u = icon * grow(ClipboardHit::Copy(i));
+                    if let Err(e) = self.draw_copy_icon(rt, cx, cy, u, &secondary) {
+                        drawn = Err(e);
+                    }
+                    let (cx, cy) = center(trash);
+                    let u = icon * grow(ClipboardHit::Remove(i));
+                    if let Err(e) = self.draw_glyph(rt, TRASH, cx, cy, u, &secondary) {
+                        drawn = Err(e);
+                    }
+                    secondary.SetOpacity(1.0);
+                }
+                // Text uses the full box, stopping before the buttons while shown
+                let right = if shown > 0.0 {
+                    copy.left
+                } else {
+                    entry.right - pad / 2.0
+                };
+                let r = RectF::new(entry.left, entry.top, right, entry.bottom);
+                match row {
+                    ClipRow::Text(t) => {
+                        let line = RectF::new(r.left + pad, r.top, r.right, r.bottom);
+                        text(t, &formats.artist, line, &primary);
+                    }
+                    ClipRow::Image(art, caption) => {
+                        let side = (r.height() - 2.0 * inset).max(1.0);
+                        let dest = RectF::new(
+                            r.left + inset,
+                            r.top + inset,
+                            r.left + inset + side,
+                            r.top + inset + side,
+                        );
+                        match self.thumb_bitmap(
+                            rt,
+                            art,
+                            side as u32,
+                            px(BASE_CLIPBOARD_THUMB_RADIUS),
+                        ) {
+                            Ok(bitmap) => rt.DrawBitmap(
+                                &bitmap,
+                                Some(&dest.to_d2d_rect()),
+                                1.0,
+                                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                                None,
+                            ),
+                            Err(e) => drawn = Err(e),
+                        }
+                        let line = RectF::new(dest.right + pad, r.top, r.right, r.bottom);
+                        text(caption, &formats.source, line, &secondary);
+                    }
+                }
+            }
+            rt.PopAxisAlignedClip();
+            drawn
+        }
+    }
+
+    /// Solid rounded X in a `u`-sized box centred on (cx, cy): two thick
+    /// round-capped bars.
+    fn draw_cross(
+        &self,
+        rt: &ID2D1RenderTarget,
+        cx: f32,
+        cy: f32,
+        u: f32,
+        brush: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
+    ) -> Result<()> {
+        let (w, a) = (0.24 * u, 0.5 * u - 0.12 * u);
+        let p = |x: f32, y: f32| D2D_POINT_2F {
+            x: cx + x,
+            y: cy + y,
+        };
+        let path = unsafe { self.d2d_factory.CreatePathGeometry()? };
+        let sink = unsafe { path.Open()? };
+        let h = unsafe { GeometrySinkHelper::from_raw(windows::core::Interface::as_raw(&sink)) };
+        unsafe {
+            for (from, to) in [((-a, -a), (a, a)), ((-a, a), (a, -a))] {
+                h.begin_figure(p(from.0, from.1));
+                h.add_line(p(to.0, to.1));
+                h.end_figure_open();
+            }
+            h.close()?;
+            rt.DrawGeometry(&path, brush, w, &self.round_stroke);
+        }
+        Ok(())
+    }
+
+    /// Outline copy icon in a `u`-sized box centred on (cx, cy): a rounded
+    /// front square, and the back square's top-right edges peeking out behind
+    /// it, stroked with round caps.
+    fn draw_copy_icon(
+        &self,
+        rt: &ID2D1RenderTarget,
+        cx: f32,
+        cy: f32,
+        u: f32,
+        brush: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
+    ) -> Result<()> {
+        let p = |x: f32, y: f32| D2D_POINT_2F {
+            x: cx + x * u,
+            y: cy + y * u,
+        };
+        // Stroke centrelines: squares of side 0.565 with 0.123 corners, the
+        // back one offset up-right by 0.364 (stroke edges reach +-0.5)
+        let (r, k) = (0.123f32, 0.552_284_8f32);
+        let c = r * k;
+        let path = unsafe { self.d2d_factory.CreatePathGeometry()? };
+        let sink = unsafe { path.Open()? };
+        let h = unsafe { GeometrySinkHelper::from_raw(windows::core::Interface::as_raw(&sink)) };
+        let bez = |c1: (f32, f32), c2: (f32, f32), end: (f32, f32)| unsafe {
+            h.add_bezier(&D2D1_BEZIER_SEGMENT {
+                point1: p(c1.0, c1.1),
+                point2: p(c2.0, c2.1),
+                point3: p(end.0, end.1),
+            })
+        };
+        let line = |x: f32, y: f32| unsafe { h.add_line(p(x, y)) };
+        unsafe {
+            // Front square, closed
+            let (x0, y0, x1, y1) = (-0.462f32, -0.098f32, 0.103f32, 0.462f32);
+            h.begin_figure(p(x0 + r, y0));
+            line(x1 - r, y0);
+            bez((x1 - r + c, y0), (x1, y0 + r - c), (x1, y0 + r));
+            line(x1, y1 - r);
+            bez((x1, y1 - r + c), (x1 - r + c, y1), (x1 - r, y1));
+            line(x0 + r, y1);
+            bez((x0 + r - c, y1), (x0, y1 - r + c), (x0, y1 - r));
+            line(x0, y0 + r);
+            bez((x0, y0 + r - c), (x0 + r - c, y0), (x0 + r, y0));
+            h.end_figure();
+            // Back square: only the part peeking out (left edge stub, top,
+            // right edge, bottom stub), open with round caps
+            let (x0, y0, x1, y1) = (-0.098f32, -0.462f32, 0.462f32, 0.103f32);
+            h.begin_figure(p(x0, -0.277));
+            line(x0, y0 + r);
+            bez((x0, y0 + r - c), (x0 + r - c, y0), (x0 + r, y0));
+            line(x1 - r, y0);
+            bez((x1 - r + c, y0), (x1, y0 + r - c), (x1, y0 + r));
+            line(x1, y1 - r);
+            bez((x1, y1 - r + c), (x1 - r + c, y1), (x1 - r, y1));
+            line(0.283, y1);
+            h.end_figure_open();
+            h.close()?;
+            rt.DrawGeometry(&path, brush, (0.085 * u).max(1.0), &self.round_stroke);
+        }
+        Ok(())
+    }
+
+    /// Thumbnail device bitmap of `art` at exactly `px` x `px` (built once per
+    /// image and size, then reused every frame).
+    fn thumb_bitmap(
+        &self,
+        rt: &ID2D1RenderTarget,
+        art: &Artwork,
+        px: u32,
+        radius: f32,
+    ) -> Result<ID2D1Bitmap> {
+        if let Some((_, _, bitmap)) = self
+            .thumbs
+            .borrow()
+            .iter()
+            .find(|(a, size, _)| a == art && *size == px)
+        {
+            return Ok(bitmap.clone());
+        }
+        let bitmap = Self::cached_bitmap(rt, &RefCell::new(None), &thumbnail(art, px, radius))?;
+        let mut thumbs = self.thumbs.borrow_mut();
+        thumbs.retain(|(a, _, _)| a != art);
+        thumbs.push((art.clone(), px, bitmap.clone()));
+        Ok(bitmap)
     }
 
     /// Thin rounded bars, centered on the slot, in the playback accent. Draws
@@ -1250,6 +2134,7 @@ impl Renderer {
         bounds: RectF,
         accent: D2D1_COLOR_F,
         scale: f32,
+        alpha: f32,
     ) -> Result<()> {
         let viz = *self.visualizer.borrow();
         if viz.level() <= 0.0 {
@@ -1258,7 +2143,7 @@ impl Renderer {
         let (bar, gap, full) = visualizer_metrics(scale);
         let cy = (bounds.top + bounds.bottom) / 2.0;
         let brush = unsafe { rt.CreateSolidColorBrush(&accent, None)? };
-        unsafe { brush.SetOpacity(viz.level()) };
+        unsafe { brush.SetOpacity(viz.level() * alpha) };
         let t = self.epoch.elapsed().as_secs_f64();
         for (i, h) in viz.bar_heights(t).into_iter().enumerate() {
             let left = bounds.left + i as f32 * (bar + gap);
@@ -1499,12 +2384,17 @@ impl Renderer {
                 elapsed: line(
                     BASE_MEDIA_TIMELINE_FONT_SIZE,
                     DWRITE_FONT_WEIGHT_REGULAR,
-                    DWRITE_TEXT_ALIGNMENT_TRAILING,
+                    DWRITE_TEXT_ALIGNMENT_LEADING,
                 )?,
                 remaining: line(
                     BASE_MEDIA_TIMELINE_FONT_SIZE,
                     DWRITE_FONT_WEIGHT_REGULAR,
-                    DWRITE_TEXT_ALIGNMENT_LEADING,
+                    DWRITE_TEXT_ALIGNMENT_TRAILING,
+                )?,
+                empty: line(
+                    BASE_MEDIA_ARTIST_FONT_SIZE,
+                    DWRITE_FONT_WEIGHT_REGULAR,
+                    DWRITE_TEXT_ALIGNMENT_CENTER,
                 )?,
             };
             *self.media_formats.borrow_mut() = Some((dimensions.dpi, formats));
@@ -1646,6 +2536,7 @@ impl Renderer {
     /// title / artist — album / source, secondary time + short date, and the
     /// transport controls with their hover/press feedback. Track content (artwork
     /// and text) carries the new-track fade; the clock and controls never fade.
+    #[cfg(test)]
     fn render_media_content(
         &self,
         rt: &ID2D1RenderTarget,
@@ -1655,6 +2546,29 @@ impl Renderer {
         clock: &ClockDateState,
         media: &MediaText,
     ) -> Result<()> {
+        // The Music composition is the one without Home's divider
+        let music = f32::from(u8::from(media_layout.divider_bounds.width() <= 0.0));
+        self.render_media_blend(rt, layout, media_layout, dimensions, clock, media, music)
+    }
+
+    /// The media composition with a Music weight (0 = Home, 1 = Music; in
+    /// between while morphing): Home-only parts (clock column, divider, badge)
+    /// fade out and Music-only parts (scrubber, visualizer) fade in.
+    #[allow(clippy::too_many_arguments)]
+    fn render_media_blend(
+        &self,
+        rt: &ID2D1RenderTarget,
+        layout: &ExpandedLayout,
+        media_layout: &MediaLayout,
+        dimensions: &NotchDimensions,
+        clock: &ClockDateState,
+        media: &MediaText,
+        music: f32,
+    ) -> Result<()> {
+        // Home-only parts leave early (gone by ~35%, before the narrowing
+        // shell would clip them); Music-only parts arrive late
+        let home_alpha = 1.0 - smoothstep(0.0, 0.35, music);
+        let music_alpha = scene_fade(music);
         let s = dimensions.scale;
         let formats = self.media_formats(dimensions)?;
         let feedback = self.feedback.borrow();
@@ -1666,9 +2580,15 @@ impl Renderer {
         };
         let title_brush = brush(&COLOR_TEXT_PRIMARY, track_alpha)?;
         let artist_brush = brush(&COLOR_TEXT_SECONDARY, track_alpha)?;
-        let source_brush = brush(&COLOR_TEXT_TERTIARY, track_alpha)?;
-        let time_brush = brush(&COLOR_TEXT_SECONDARY, 1.0)?;
-        let date_brush = brush(&COLOR_TEXT_TERTIARY, 1.0)?;
+        // The source row is Home-only, unless it stands in for a missing artist
+        let source_alpha = if media.subtitle.is_empty() {
+            1.0
+        } else {
+            home_alpha
+        };
+        let source_brush = brush(&COLOR_TEXT_TERTIARY, track_alpha * source_alpha)?;
+        let time_brush = brush(&COLOR_TEXT_SECONDARY, home_alpha)?;
+        let date_brush = brush(&COLOR_TEXT_TERTIARY, home_alpha)?;
         let icon_brush = brush(&COLOR_TEXT_PRIMARY, 1.0)?;
         let draw = |text: &[u16], format: &IDWriteTextFormat, rect: RectF, brush| unsafe {
             rt.DrawText(
@@ -1682,12 +2602,26 @@ impl Renderer {
         };
 
         // The artwork sits out at the notch edge, left of the content area
-        let clip_bounds = media_layout
-            .artwork_bounds
-            .map_or(layout.content_bounds, |a| {
-                let c = layout.content_bounds;
-                RectF::new(a.left.min(c.left), c.top, c.right, c.bottom.max(a.bottom))
-            });
+        // Content area, grown to everything the composition places outside it:
+        // the artwork at the notch edge (Home), the Music player's wider column
+        // (cover, scrubber, visualizer) and its larger controls' backdrops
+        let clip_bounds = {
+            let c = layout.content_bounds;
+            let mut parts = vec![
+                media_layout.timeline_bounds,
+                media_layout.visualizer_bounds,
+                media_layout.control_visual_bounds(MediaControl::PlayPause),
+            ];
+            parts.extend(media_layout.artwork_bounds);
+            parts.into_iter().fold(c, |u, r| {
+                RectF::new(
+                    u.left.min(r.left),
+                    u.top.min(r.top),
+                    u.right.max(r.right),
+                    u.bottom.max(r.bottom),
+                )
+            })
+        };
         unsafe {
             rt.PushAxisAlignedClip(
                 &clip_bounds.to_d2d_rect(),
@@ -1696,22 +2630,37 @@ impl Renderer {
         }
 
         if let (Some(artwork), Some(dest)) = (&media.content.artwork, media_layout.artwork_bounds) {
-            // Follows the notch's bottom corner (its radius minus the gap between
-            // them), softened slightly so the cover reads a touch rounder.
-            let gap = dimensions.notch_height() - dest.bottom;
-            self.draw_artwork(
-                rt,
-                artwork,
-                dest,
-                (dimensions.curvature.bottom_radius - gap + BASE_MEDIA_ARTWORK_RADIUS_EXTRA * s)
-                    .max(0.0),
-                s,
-                track_alpha,
-            )?;
-            if let Some(icon) = &media.content.source.icon {
+            // Home: follows the notch's bottom corner (its radius minus the gap
+            // between them), softened slightly so the cover reads a touch rounder.
+            // Music: the small player cover has its own modest radius.
+            // Home's radius comes from its settled notch (the cover nests in
+            // its bottom corner); Music's small player cover has its own
+            let home = space_dimensions(
+                crate::config::NotchState::Expanded,
+                dimensions.dpi,
+                NottSpace::Home,
+            );
+            let home_radius =
+                resolve_media_layout_in(&home, media.content.shape(), NottSpace::Home)
+                    .and_then(|l| l.artwork_bounds)
+                    .map_or(0.0, |a| {
+                        let gap = home.notch_height() - a.bottom;
+                        (home.curvature.bottom_radius - gap + BASE_MEDIA_ARTWORK_RADIUS_EXTRA * s)
+                            .max(0.0)
+                    });
+            let radius = home_radius + (BASE_MUSIC_ARTWORK_RADIUS * s - home_radius) * music;
+            self.draw_artwork(rt, artwork, dest, radius, s, track_alpha)?;
+            // The source badge belongs to Home; the Music player cover is clean
+            if let Some(icon) = media
+                .content
+                .source
+                .icon
+                .as_ref()
+                .filter(|_| home_alpha > 0.0)
+            {
                 // The badge overhangs the content area: draw it outside the content clip
                 unsafe { rt.PopAxisAlignedClip() };
-                self.draw_badge(rt, icon, dest, clip_bounds, s, track_alpha)?;
+                self.draw_badge(rt, icon, dest, clip_bounds, s, track_alpha * home_alpha)?;
                 unsafe {
                     rt.PushAxisAlignedClip(
                         &clip_bounds.to_d2d_rect(),
@@ -1742,71 +2691,70 @@ impl Renderer {
             } else {
                 media_layout.source_bounds
             };
-            draw(&media.source, &formats.source, rect, &source_brush);
+            if rect.height() > 0.0 {
+                draw(&media.source, &formats.source, rect, &source_brush);
+            }
         }
 
-        // Secondary live time / short date in the right column
-        let time_utf16: Vec<u16> = clock.formatted_time.encode_utf16().collect();
-        draw(
-            &time_utf16,
-            &formats.time,
-            media_layout.time_bounds,
-            &time_brush,
-        );
-        let date_utf16: Vec<u16> = clock.formatted_date_short.encode_utf16().collect();
-        draw(
-            &date_utf16,
-            &formats.date,
-            media_layout.date_bounds,
-            &date_brush,
-        );
+        // Home: thin divider between the track text and the time/date
+        let divider = media_layout.divider_bounds;
+        if divider.width() > 0.0 && divider.height() > 0.0 && home_alpha > 0.0 {
+            unsafe {
+                let line = rt.CreateSolidColorBrush(&COLOR_MEDIA_DIVIDER, None)?;
+                line.SetOpacity(home_alpha);
+                rt.FillRectangle(&divider.to_d2d_rect(), &line);
+            }
+        }
+
+        // Secondary live time / short date in the right column (Home only;
+        // the Music layout has no clock column)
+        if media_layout.time_bounds.width() > 0.0 && home_alpha > 0.0 {
+            let time_utf16: Vec<u16> = clock.formatted_time.encode_utf16().collect();
+            draw(
+                &time_utf16,
+                &formats.time,
+                media_layout.time_bounds,
+                &time_brush,
+            );
+            let date_utf16: Vec<u16> = clock.formatted_date_short.encode_utf16().collect();
+            draw(
+                &date_utf16,
+                &formats.date,
+                media_layout.date_bounds,
+                &date_brush,
+            );
+        }
 
         // Playback accent (shared by visualizer and scrubber): swaps with the
         // artwork, so it rides the same track fade and never lags a track
         let accent = accent_color(Some(&media.content));
-        self.draw_visualizer(rt, media_layout.visualizer_bounds, accent, s)?;
-        self.draw_timeline(
-            rt,
-            media_layout.timeline_bounds,
-            &media.content,
-            &formats,
-            accent,
-            s,
-            track_alpha,
-        )?;
+        if media_layout.visualizer_bounds.width() > 0.0 && music_alpha > 0.0 {
+            self.draw_visualizer(rt, media_layout.visualizer_bounds, accent, s, music_alpha)?;
+        }
+        if music_alpha > 0.0 {
+            self.draw_timeline(
+                rt,
+                media_layout.timeline_bounds,
+                &media.content,
+                &formats,
+                accent,
+                s,
+                track_alpha * music_alpha,
+            )?;
+        }
 
-        // Transport controls: soft control-local backdrop, icons quiet at rest and
-        // full on hover/press, compressed while pressed.
-        let backdrop = brush(
-            &D2D1_COLOR_F {
-                a: 1.0,
-                ..COLOR_MEDIA_CONTROL_HOVER
-            },
-            0.0,
-        )?;
+        // Transport controls: no backdrop; icons quiet at rest and full on
+        // hover/press, compressed while pressed.
         for control in MediaControl::ALL {
             let v = media_layout.control_visual_bounds(control);
             let (cx, cy) = ((v.left + v.right) / 2.0, (v.top + v.bottom) / 2.0);
             let (hover, press) = feedback.levels(control);
-            let alpha =
-                COLOR_MEDIA_CONTROL_HOVER.a * hover.max(press) + MEDIA_CONTROL_PRESS_ALPHA * press;
-            if alpha > 0.0 {
-                unsafe {
-                    backdrop.SetOpacity(alpha);
-                    rt.FillRoundedRectangle(
-                        &D2D1_ROUNDED_RECT {
-                            rect: v.to_d2d_rect(),
-                            radiusX: v.width() / 2.0,
-                            radiusY: v.height() / 2.0,
-                        },
-                        &backdrop,
-                    );
-                }
-            }
-            let base = match control {
-                MediaControl::PlayPause => BASE_MEDIA_PLAY_ICON_SIZE,
-                _ => BASE_MEDIA_ICON_SIZE,
+            // Same glyphs; the Music player draws them larger
+            let (home_size, music_size) = match control {
+                MediaControl::PlayPause => (BASE_MEDIA_PLAY_ICON_SIZE, BASE_MUSIC_PLAY_ICON_SIZE),
+                _ => (BASE_MEDIA_ICON_SIZE, BASE_MUSIC_ICON_SIZE),
             };
+            let base = home_size + (music_size - home_size) * music;
             // Smooth press curve: eased compression and spring back
             let eased = press * press * (3.0 - 2.0 * press);
             let u = (base * s).round() * (1.0 - (1.0 - MEDIA_PRESS_ICON_SCALE) * eased);
@@ -2055,38 +3003,23 @@ impl Renderer {
             let layout = resolve_layout(dimensions);
             match &layout {
                 ResolvedLayout::Collapsed { components, .. } => {
-                    self.render_collapsed_content(
-                        rt,
-                        components,
-                        dimensions,
-                        &clock.formatted_time,
-                    )?;
+                    // Fades back in as a collapse nears its end
+                    let alpha = self.scene_view().alpha;
+                    if alpha > 0.0 {
+                        self.with_layer(rt, None, alpha, || {
+                            self.render_collapsed_content(
+                                rt,
+                                components,
+                                dimensions,
+                                &clock.formatted_time,
+                            )
+                        })?;
+                    }
                 }
-                ResolvedLayout::Expanded { components, .. } => {
+                ResolvedLayout::Expanded { .. } => {
                     let min_content_height = (50.0 * dimensions.scale).round() as i32;
-                    let media = self.media.borrow();
-                    let media_layout = media
-                        .as_ref()
-                        .and_then(|m| resolve_media_layout(dimensions, m.content.shape()));
-                    if dimensions.height >= min_content_height
-                        && let (Some(media), Some(media_layout)) = (media.as_ref(), media_layout)
-                    {
-                        self.render_media_content(
-                            rt,
-                            components,
-                            &media_layout,
-                            dimensions,
-                            clock,
-                            media,
-                        )?;
-                    } else if dimensions.height >= min_content_height {
-                        self.render_expanded_content(
-                            rt,
-                            components,
-                            dimensions,
-                            &clock.formatted_time,
-                            &clock.formatted_date,
-                        )?;
+                    if dimensions.height >= min_content_height {
+                        self.draw_expanded(rt, dimensions, clock)?;
                     } else {
                         let collapsed_layout = resolve_collapsed_layout(dimensions);
                         self.render_collapsed_content(
@@ -2166,10 +3099,216 @@ impl Drop for Renderer {
     }
 }
 
+/// One step of an icon outline in a unit box (-0.5..0.5, y down): move, line,
+/// cubic Bezier (two controls, end), close.
+#[derive(Clone, Copy)]
+enum IconSeg {
+    M(f32, f32),
+    L(f32, f32),
+    C(f32, f32, f32, f32, f32, f32),
+    Z,
+}
+
+// Space icons: outlines of Flaticon UIcons (solid rounded, used under the
+// project's Flaticon license), converted from the font glyphs to cubic paths.
+/// Flaticon UIcons solid-rounded `house-blank` (U+F7C2).
+const HOUSE_BLANK: &[IconSeg] = &[
+    IconSeg::M(0.2933, 0.5),
+    IconSeg::L(-0.29, 0.5),
+    IconSeg::C(-0.3278, 0.5, -0.3628, 0.4906, -0.395, 0.4717),
+    IconSeg::C(-0.4272, 0.4528, -0.4528, 0.4272, -0.4717, 0.395),
+    IconSeg::C(-0.4906, 0.3628, -0.5, 0.3278, -0.5, 0.29),
+    IconSeg::L(-0.5, -0.0933),
+    IconSeg::C(-0.5, -0.1289, -0.4917, -0.1622, -0.475, -0.1933),
+    IconSeg::C(-0.4583, -0.2244, -0.4356, -0.2489, -0.4067, -0.2667),
+    IconSeg::L(-0.1167, -0.4633),
+    IconSeg::C(-0.0811, -0.4878, -0.0422, -0.5, 0.0, -0.5),
+    IconSeg::C(0.0422, -0.5, 0.0811, -0.4878, 0.1167, -0.4633),
+    IconSeg::L(0.4067, -0.2667),
+    IconSeg::C(0.4356, -0.2489, 0.4583, -0.2244, 0.475, -0.1933),
+    IconSeg::C(0.4917, -0.1622, 0.5, -0.1289, 0.5, -0.0933),
+    IconSeg::L(0.5, 0.29),
+    IconSeg::C(0.5, 0.3278, 0.4906, 0.3628, 0.4717, 0.395),
+    IconSeg::C(0.4528, 0.4272, 0.4272, 0.4528, 0.395, 0.4717),
+    IconSeg::C(0.3628, 0.4906, 0.3289, 0.5, 0.2933, 0.5),
+    IconSeg::Z,
+];
+/// Flaticon UIcons solid-rounded `music-alt` (U+F985).
+const MUSIC_ALT: &[IconSeg] = &[
+    IconSeg::M(0.44, -0.46),
+    IconSeg::C(0.42, -0.4778, 0.3983, -0.4894, 0.375, -0.495),
+    IconSeg::C(0.3517, -0.5006, 0.3278, -0.5011, 0.3033, -0.4967),
+    IconSeg::L(-0.08, -0.4267),
+    IconSeg::C(-0.1289, -0.4156, -0.1694, -0.3911, -0.2017, -0.3533),
+    IconSeg::C(-0.2339, -0.3156, -0.25, -0.2711, -0.25, -0.22),
+    IconSeg::L(-0.25, 0.19),
+    IconSeg::C(-0.2767, 0.1744, -0.3044, 0.1667, -0.3333, 0.1667),
+    IconSeg::C(-0.38, 0.1667, -0.4194, 0.1828, -0.4517, 0.215),
+    IconSeg::C(-0.4839, 0.2472, -0.5, 0.2867, -0.5, 0.3333),
+    IconSeg::C(-0.5, 0.38, -0.4839, 0.4194, -0.4517, 0.4517),
+    IconSeg::C(-0.4194, 0.4839, -0.38, 0.5, -0.3333, 0.5),
+    IconSeg::C(-0.2867, 0.5, -0.2472, 0.4839, -0.215, 0.4517),
+    IconSeg::C(-0.1828, 0.4194, -0.1667, 0.38, -0.1667, 0.3333),
+    IconSeg::L(-0.1667, -0.0467),
+    IconSeg::C(-0.1667, -0.0667, -0.16, -0.0844, -0.1467, -0.1),
+    IconSeg::C(-0.1333, -0.1156, -0.1178, -0.1256, -0.1, -0.13),
+    IconSeg::L(0.3667, -0.2167),
+    IconSeg::C(0.38, -0.2189, 0.3917, -0.2156, 0.4017, -0.2067),
+    IconSeg::C(0.4117, -0.1978, 0.4167, -0.1867, 0.4167, -0.1733),
+    IconSeg::L(0.4167, 0.0633),
+    IconSeg::C(0.39, 0.05, 0.3622, 0.0422, 0.3333, 0.04),
+    IconSeg::C(0.2867, 0.04, 0.2472, 0.0567, 0.215, 0.09),
+    IconSeg::C(0.1828, 0.1233, 0.1667, 0.1628, 0.1667, 0.2083),
+    IconSeg::C(0.1667, 0.2539, 0.1828, 0.2928, 0.215, 0.325),
+    IconSeg::C(0.2472, 0.3572, 0.2867, 0.3733, 0.3333, 0.3733),
+    IconSeg::C(0.38, 0.3733, 0.4194, 0.3572, 0.4517, 0.325),
+    IconSeg::C(0.4839, 0.2928, 0.5, 0.2533, 0.5, 0.2067),
+    IconSeg::L(0.5, -0.3333),
+    IconSeg::C(0.5, -0.3578, 0.495, -0.3811, 0.485, -0.4033),
+    IconSeg::C(0.475, -0.4256, 0.46, -0.4444, 0.44, -0.46),
+    IconSeg::Z,
+];
+/// Flaticon UIcons solid-rounded `clipboard` (U+F437).
+const CLIPBOARD: &[IconSeg] = &[
+    IconSeg::M(0.0417, -0.3333),
+    IconSeg::L(-0.0417, -0.3333),
+    IconSeg::C(-0.0661, -0.3333, -0.0867, -0.3417, -0.1033, -0.3583),
+    IconSeg::C(-0.12, -0.375, -0.1283, -0.3944, -0.1283, -0.4167),
+    IconSeg::C(-0.1283, -0.4389, -0.12, -0.4583, -0.1033, -0.475),
+    IconSeg::C(-0.0867, -0.4917, -0.0661, -0.5, -0.0417, -0.5),
+    IconSeg::L(0.0417, -0.5),
+    IconSeg::C(0.0639, -0.5, 0.0833, -0.4917, 0.1, -0.475),
+    IconSeg::C(0.1167, -0.4583, 0.125, -0.4389, 0.125, -0.4167),
+    IconSeg::C(0.125, -0.3944, 0.1167, -0.375, 0.1, -0.3583),
+    IconSeg::C(0.0833, -0.3417, 0.0639, -0.3333, 0.0417, -0.3333),
+    IconSeg::Z,
+    IconSeg::M(0.205, -0.4133),
+    IconSeg::C(0.205, -0.3667, 0.1889, -0.3278, 0.1567, -0.2967),
+    IconSeg::C(0.1244, -0.2656, 0.0861, -0.25, 0.0417, -0.25),
+    IconSeg::L(-0.0417, -0.25),
+    IconSeg::C(-0.0883, -0.25, -0.1278, -0.2656, -0.16, -0.2967),
+    IconSeg::C(-0.1922, -0.3278, -0.2083, -0.3667, -0.2083, -0.4133),
+    IconSeg::C(-0.2572, -0.4022, -0.2972, -0.3778, -0.3283, -0.34),
+    IconSeg::C(-0.3594, -0.3022, -0.375, -0.2578, -0.375, -0.2067),
+    IconSeg::L(-0.375, 0.29),
+    IconSeg::C(-0.375, 0.3278, -0.3661, 0.3628, -0.3483, 0.395),
+    IconSeg::C(-0.3306, 0.4272, -0.3056, 0.4528, -0.2733, 0.4717),
+    IconSeg::C(-0.2411, 0.4906, -0.2061, 0.5, -0.1683, 0.5),
+    IconSeg::L(0.165, 0.5),
+    IconSeg::C(0.2028, 0.5, 0.2378, 0.4906, 0.27, 0.4717),
+    IconSeg::C(0.3022, 0.4528, 0.3278, 0.4272, 0.3467, 0.395),
+    IconSeg::C(0.3656, 0.3628, 0.375, 0.3278, 0.375, 0.29),
+    IconSeg::L(0.375, -0.21),
+    IconSeg::C(0.375, -0.2589, 0.3589, -0.3022, 0.3267, -0.34),
+    IconSeg::C(0.2944, -0.3778, 0.2539, -0.4022, 0.205, -0.4133),
+    IconSeg::Z,
+];
+/// Flaticon UIcons solid-rounded `trash` (U+FDDF): clipboard row delete button.
+const TRASH: &[IconSeg] = &[
+    IconSeg::M(0.3767, -0.3333),
+    IconSeg::L(0.2467, -0.3333),
+    IconSeg::C(0.2356, -0.3822, 0.2111, -0.4222, 0.1733, -0.4533),
+    IconSeg::C(0.1356, -0.4844, 0.0911, -0.5, 0.04, -0.5),
+    IconSeg::L(-0.0433, -0.5),
+    IconSeg::C(-0.0922, -0.5, -0.1356, -0.4844, -0.1733, -0.4533),
+    IconSeg::C(-0.2111, -0.4222, -0.2356, -0.3822, -0.2467, -0.3333),
+    IconSeg::L(-0.3733, -0.3333),
+    IconSeg::C(-0.3867, -0.3333, -0.3972, -0.3294, -0.405, -0.3217),
+    IconSeg::C(-0.4128, -0.3139, -0.4167, -0.3039, -0.4167, -0.2917),
+    IconSeg::C(-0.4167, -0.2794, -0.4128, -0.2694, -0.405, -0.2617),
+    IconSeg::C(-0.3972, -0.2539, -0.3878, -0.25, -0.3767, -0.25),
+    IconSeg::L(-0.3333, -0.25),
+    IconSeg::L(-0.3333, 0.29),
+    IconSeg::C(-0.3333, 0.3278, -0.3239, 0.3628, -0.305, 0.395),
+    IconSeg::C(-0.2861, 0.4272, -0.2606, 0.4528, -0.2283, 0.4717),
+    IconSeg::C(-0.1961, 0.4906, -0.1622, 0.5, -0.1267, 0.5),
+    IconSeg::L(0.1267, 0.5),
+    IconSeg::C(0.1622, 0.5, 0.1961, 0.4906, 0.2283, 0.4717),
+    IconSeg::C(0.2606, 0.4528, 0.2861, 0.4272, 0.305, 0.395),
+    IconSeg::C(0.3239, 0.3628, 0.3333, 0.3278, 0.3333, 0.29),
+    IconSeg::L(0.3333, -0.25),
+    IconSeg::L(0.3767, -0.25),
+    IconSeg::C(0.3878, -0.25, 0.3972, -0.2539, 0.405, -0.2617),
+    IconSeg::C(0.4128, -0.2694, 0.4167, -0.2794, 0.4167, -0.2917),
+    IconSeg::C(0.4167, -0.3039, 0.4128, -0.3139, 0.405, -0.3217),
+    IconSeg::C(0.3972, -0.3294, 0.3878, -0.3333, 0.3767, -0.3333),
+    IconSeg::Z,
+    IconSeg::M(-0.04, 0.21),
+    IconSeg::C(-0.04, 0.2211, -0.0444, 0.2306, -0.0533, 0.2383),
+    IconSeg::C(-0.0622, 0.2461, -0.0722, 0.25, -0.0833, 0.25),
+    IconSeg::C(-0.0944, 0.25, -0.1044, 0.2461, -0.1133, 0.2383),
+    IconSeg::C(-0.1222, 0.2306, -0.1267, 0.2211, -0.1267, 0.21),
+    IconSeg::L(-0.1267, -0.04),
+    IconSeg::C(-0.1244, -0.0533, -0.1194, -0.0639, -0.1117, -0.0717),
+    IconSeg::C(-0.1039, -0.0794, -0.0944, -0.0833, -0.0833, -0.0833),
+    IconSeg::C(-0.0722, -0.0833, -0.0628, -0.0794, -0.055, -0.0717),
+    IconSeg::C(-0.0472, -0.0639, -0.0433, -0.0533, -0.0433, -0.04),
+    IconSeg::L(-0.0433, 0.21),
+    IconSeg::Z,
+    IconSeg::M(0.1267, 0.21),
+    IconSeg::C(0.1267, 0.2211, 0.1222, 0.2306, 0.1133, 0.2383),
+    IconSeg::C(0.1044, 0.2461, 0.0944, 0.25, 0.0833, 0.25),
+    IconSeg::C(0.0722, 0.25, 0.0628, 0.2461, 0.055, 0.2383),
+    IconSeg::C(0.0472, 0.2306, 0.0433, 0.2211, 0.0433, 0.21),
+    IconSeg::L(0.0433, -0.04),
+    IconSeg::C(0.0433, -0.0533, 0.0472, -0.0639, 0.055, -0.0717),
+    IconSeg::C(0.0628, -0.0794, 0.0722, -0.0833, 0.0833, -0.0833),
+    IconSeg::C(0.0944, -0.0833, 0.1044, -0.0794, 0.1133, -0.0717),
+    IconSeg::C(0.1222, -0.0639, 0.1267, -0.0533, 0.1267, -0.04),
+    IconSeg::Z,
+    IconSeg::M(-0.16, -0.3333),
+    IconSeg::C(-0.1511, -0.3578, -0.1356, -0.3778, -0.1133, -0.3933),
+    IconSeg::C(-0.0911, -0.4089, -0.0667, -0.4167, -0.04, -0.4167),
+    IconSeg::L(0.0433, -0.4167),
+    IconSeg::C(0.0678, -0.4167, 0.0911, -0.4089, 0.1133, -0.3933),
+    IconSeg::C(0.1356, -0.3778, 0.1511, -0.3578, 0.16, -0.3333),
+    IconSeg::Z,
+];
+/// Drop page glyph: "Inbox" by Jivan from the Noun Project (noun 1052548),
+/// a tray outline with the drop slot cut out (even-odd fill).
+const INBOX: &[IconSeg] = &[
+    IconSeg::M(0.3836, -0.2868),
+    IconSeg::C(0.3646, -0.326, 0.3254, -0.3498, 0.2815, -0.3498),
+    IconSeg::L(-0.2827, -0.3498),
+    IconSeg::C(-0.3266, -0.3498, -0.3646, -0.326, -0.3848, -0.2868),
+    IconSeg::L(-0.4941, -0.0659),
+    IconSeg::C(-0.4976, -0.0588, -0.5, -0.0517, -0.5, -0.0445),
+    IconSeg::C(-0.5, -0.0445, -0.5, -0.0445, -0.5, -0.0445),
+    IconSeg::C(-0.5, -0.0445, -0.5, -0.0445, -0.5, -0.0445),
+    IconSeg::C(-0.5, -0.0445, -0.5, -0.0445, -0.5, -0.0445),
+    IconSeg::C(-0.5, -0.0445, -0.5, -0.0445, -0.5, -0.0445),
+    IconSeg::L(-0.5, 0.2548),
+    IconSeg::C(-0.5, 0.307, -0.4572, 0.3498, -0.405, 0.3498),
+    IconSeg::L(0.405, 0.3498),
+    IconSeg::C(0.4572, 0.3498, 0.5, 0.307, 0.5, 0.2548),
+    IconSeg::L(0.5, -0.0433),
+    IconSeg::C(0.5, -0.0433, 0.5, -0.0433, 0.5, -0.0433),
+    IconSeg::C(0.5, -0.0433, 0.5, -0.0433, 0.5, -0.0433),
+    IconSeg::C(0.5, -0.0433, 0.5, -0.0433, 0.5, -0.0433),
+    IconSeg::C(0.5, -0.0433, 0.5, -0.0433, 0.5, -0.0433),
+    IconSeg::C(0.5, -0.0517, 0.4976, -0.0588, 0.4941, -0.0647),
+    IconSeg::L(0.3836, -0.2868),
+    IconSeg::Z,
+    IconSeg::M(-0.2993, -0.2441),
+    IconSeg::C(-0.2957, -0.25, -0.2898, -0.2548, -0.2827, -0.2548),
+    IconSeg::L(0.2815, -0.2548),
+    IconSeg::C(0.2886, -0.2548, 0.2945, -0.2512, 0.2981, -0.2441),
+    IconSeg::L(0.3741, -0.0909),
+    IconSeg::L(0.1936, -0.0909),
+    IconSeg::C(0.171, -0.0909, 0.152, -0.0754, 0.1473, -0.0529),
+    IconSeg::C(0.1461, -0.0481, 0.1211, 0.0707, -0.0, 0.0707),
+    IconSeg::C(-0.1176, 0.0707, -0.1449, -0.0398, -0.1473, -0.0529),
+    IconSeg::C(-0.152, -0.0754, -0.171, -0.0909, -0.1936, -0.0909),
+    IconSeg::L(-0.3753, -0.0909),
+    IconSeg::L(-0.2993, -0.2441),
+    IconSeg::Z,
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::NotchState;
+    use crate::layout::resolve_space_selector_in;
 
     #[test]
     fn test_renderer_initialization_and_drawing() {
@@ -2386,7 +3525,7 @@ mod tests {
         let border_width = dims.border_width;
 
         assert_eq!(width, 600);
-        assert_eq!(height, 128);
+        assert_eq!(height, 138);
 
         unsafe {
             let screen_dc = GetDC(None);
@@ -3740,17 +4879,24 @@ mod tests {
     }
 
     #[test]
-    fn test_press_and_hover_shade_only_the_control() {
+    fn test_hover_and_press_brighten_icon_without_backdrop() {
         let renderer = Renderer::new().expect("renderer");
         let dims = NotchDimensions::from_state_and_dpi(NotchState::Expanded, 96);
         let c = content("Song", None);
         let m = resolve_media_layout(&dims, c.shape()).unwrap();
-        let backdrop_corner = |px: &[u32], stride: usize, k: MediaControl| {
-            // A point inside the round backdrop but away from the icon
+        // A point inside the old round backdrop but away from the icon
+        let corner = |px: &[u32], stride: usize, k: MediaControl| {
             let v = m.control_visual_bounds(k);
-            let x = ((v.left + v.right) / 2.0) as usize;
-            let y = (v.top + 2.0) as usize;
-            px[y * stride + x] & 0xFF
+            px[(v.top + 2.0) as usize * stride + ((v.left + v.right) / 2.0) as usize] & 0xFF
+        };
+        // Brightest icon pixel of a control
+        let icon = |px: &[u32], stride: usize, k: MediaControl| {
+            let v = m.control_visual_bounds(k);
+            (v.top as usize..v.bottom as usize)
+                .flat_map(|y| (v.left as usize..v.right as usize).map(move |x| (x, y)))
+                .map(|(x, y)| px[y * stride + x] & 0xFF)
+                .max()
+                .unwrap()
         };
         let (idle, stride) = render_media_frame(&renderer, &dims, &c);
         renderer.feedback().set_hovered(Some(MediaControl::Next));
@@ -3759,15 +4905,22 @@ mod tests {
         renderer.feedback().press(MediaControl::Next);
         renderer.feedback().step(1000.0);
         let (pressed, _) = render_media_frame(&renderer, &dims, &c);
-        let next = |px: &[u32]| backdrop_corner(px, stride, MediaControl::Next);
-        let prev = |px: &[u32]| backdrop_corner(px, stride, MediaControl::Previous);
-        assert_eq!(next(&idle), 0, "no backdrop at rest");
-        assert!(next(&hover) > 0, "hover shades the control");
+        for (state, px) in [("idle", &idle), ("hover", &hover), ("pressed", &pressed)] {
+            assert_eq!(
+                corner(px, stride, MediaControl::Next),
+                0,
+                "no backdrop when {state}"
+            );
+        }
         assert!(
-            next(&pressed) > next(&hover),
-            "press shades more than hover"
+            icon(&hover, stride, MediaControl::Next) > icon(&idle, stride, MediaControl::Next),
+            "hover brightens the icon"
         );
-        assert_eq!(prev(&pressed), 0, "other controls unaffected");
+        assert_eq!(
+            icon(&pressed, stride, MediaControl::Previous),
+            icon(&idle, stride, MediaControl::Previous),
+            "other controls unaffected"
+        );
     }
 
     #[test]
@@ -4341,7 +5494,6 @@ mod tests {
         let renderer = Renderer::new().expect("renderer");
         for dpi in [96u32, 144] {
             let collapsed = NotchDimensions::from_state_and_dpi(NotchState::Collapsed, dpi);
-            let expanded = NotchDimensions::from_state_and_dpi(NotchState::Expanded, dpi);
             let viz_c = resolve_collapsed_layout(&collapsed).visualizer_bounds;
 
             renderer.set_media(Some(&playing_content(P::Playing)));
@@ -4355,9 +5507,13 @@ mod tests {
                 accent_in(&px, stride, viz_c),
                 "collapsed bars in the accent at {dpi}"
             );
+            // Expanded: the Music space shows the bars (Home's expanded notch
+            // has none)
+            let expanded =
+                crate::layout::space_dimensions(NotchState::Expanded, dpi, NottSpace::Music);
             let c = playing_content(P::Playing);
-            let m = resolve_media_layout(&expanded, c.shape()).unwrap();
-            let (px, stride) = render_media_frame(&renderer, &expanded, &c);
+            let m = resolve_media_layout_in(&expanded, c.shape(), NottSpace::Music).unwrap();
+            let (px, stride) = music_frame(&renderer, &expanded, &c);
             assert!(
                 accent_in(&px, stride, m.visualizer_bounds),
                 "expanded bars at {dpi}"
@@ -4372,8 +5528,7 @@ mod tests {
                 !accent_in(&px, stride, viz_c),
                 "no bars when paused at {dpi}"
             );
-            let (px, stride) =
-                render_media_frame(&renderer, &expanded, &playing_content(P::Paused));
+            let (px, stride) = music_frame(&renderer, &expanded, &playing_content(P::Paused));
             assert!(!accent_in(&px, stride, m.visualizer_bounds));
 
             // No media session: hidden and idle
@@ -4391,11 +5546,12 @@ mod tests {
     fn test_scrubber_played_part_uses_accent_and_hides_without_timeline() {
         use crate::media::PlaybackState as P;
         let renderer = Renderer::new().expect("renderer");
-        let dims = NotchDimensions::from_state_and_dpi(NotchState::Expanded, 96);
+        // The scrubber lives in the Music space
+        let dims = crate::layout::space_dimensions(NotchState::Expanded, 96, NottSpace::Music);
         let c = playing_content(P::Paused);
-        let m = resolve_media_layout(&dims, c.shape()).unwrap();
+        let m = resolve_media_layout_in(&dims, c.shape(), NottSpace::Music).unwrap();
         let strip = m.timeline_bounds;
-        let (px, stride) = render_media_frame(&renderer, &dims, &c);
+        let (px, stride) = music_frame(&renderer, &dims, &c);
         // Track spans label + gap .. strip end - label - gap; half played
         let track_l = strip.left + BASE_MEDIA_TIMELINE_LABEL_WIDTH + BASE_MEDIA_TIMELINE_LABEL_GAP;
         let track_r = strip.right - BASE_MEDIA_TIMELINE_LABEL_WIDTH - BASE_MEDIA_TIMELINE_LABEL_GAP;
@@ -4445,7 +5601,7 @@ mod tests {
             accent: None,
             ..c.clone()
         };
-        let (px, stride) = render_media_frame(&renderer, &dims, &neutral);
+        let (px, stride) = music_frame(&renderer, &dims, &neutral);
         assert!(!accent_in(&px, stride, strip));
         assert!(
             lit_in(&px, stride, row(track_l + 2.0, track_l + q), 150),
@@ -4457,7 +5613,817 @@ mod tests {
             timeline: None,
             ..c
         };
-        let (px, stride) = render_media_frame(&renderer, &dims, &none);
+        let (px, stride) = music_frame(&renderer, &dims, &none);
         assert!(!lit_in(&px, stride, strip, 20), "scrubber omitted");
+    }
+
+    /// Expanded notch body plus the space selector only.
+    fn render_selector_frame(renderer: &Renderer, dims: &NotchDimensions) -> (Vec<u32>, usize) {
+        renderer.ensure_buffer(dims.width, dims.height).unwrap();
+        let rt_ref = renderer.cached_rt.borrow();
+        let rt = rt_ref.as_ref().unwrap();
+        unsafe {
+            let bind = RECT {
+                left: 0,
+                top: 0,
+                right: dims.width,
+                bottom: dims.height,
+            };
+            rt.BindDC(renderer.cached_mem_dc.get(), &bind).unwrap();
+            rt.BeginDraw();
+            rt.Clear(Some(&COLOR_TRANSPARENT));
+            let fill = rt.CreateSolidColorBrush(&NOTCH_BG_COLOR, None).unwrap();
+            rt.FillGeometry(&renderer.create_notch_geometry(dims).unwrap(), &fill, None);
+            renderer.draw_space_selector(rt, dims).unwrap();
+            rt.EndDraw(None, None).unwrap();
+        }
+        let stride = renderer.cached_capacity_w.get() as usize;
+        let bits = renderer.cached_bits.get() as *const u32;
+        let pixels = unsafe { std::slice::from_raw_parts(bits, stride * dims.height as usize) };
+        (pixels.to_vec(), stride)
+    }
+
+    #[test]
+    fn test_space_selector_reflects_active_space() {
+        let renderer = Renderer::new().expect("renderer");
+        for dpi in [96u32, 144] {
+            let dims = NotchDimensions::from_state_and_dpi(NotchState::Expanded, dpi);
+            // The pills follow the active space's content edge
+            let sel = resolve_space_selector_in(&dims, NottSpace::Home).unwrap();
+            // Capsule fill sampled away from the label text (left end, centered)
+            let fill_at = |px: &[u32], stride: usize, s: NottSpace, active: NottSpace| {
+                let r = resolve_space_selector_in(&dims, active).unwrap().bounds(s);
+                let (x, y) = (
+                    (r.left + r.height() * 0.35) as usize,
+                    ((r.top + r.bottom) / 2.0) as usize,
+                );
+                px[y * stride + x] & 0xFF
+            };
+            // Default: Home selected
+            renderer.set_space(NottSpace::default());
+            let (px, stride) = render_selector_frame(&renderer, &dims);
+            assert!(
+                fill_at(&px, stride, NottSpace::Home, NottSpace::Home) > 15,
+                "Home capsule filled at {dpi}"
+            );
+            assert_eq!(
+                fill_at(&px, stride, NottSpace::Music, NottSpace::Home),
+                0,
+                "Music unfilled at {dpi}"
+            );
+            assert!(
+                lit_in(&px, stride, sel.music, 60),
+                "Music label still visible"
+            );
+            // Music, then back to Home, repeatedly: the drawing follows the state
+            for target in [NottSpace::Music, NottSpace::Home, NottSpace::Music] {
+                renderer.set_space(target);
+                let (px, stride) = render_selector_frame(&renderer, &dims);
+                for s in NottSpace::ALL {
+                    assert_eq!(
+                        fill_at(&px, stride, s, target) > 15,
+                        s == target,
+                        "{s:?} at {dpi}"
+                    );
+                }
+            }
+            renderer.set_space(NottSpace::Home);
+        }
+        assert!(
+            !renderer.set_space(NottSpace::Home),
+            "no change, no redraw needed"
+        );
+        assert!(renderer.set_space(NottSpace::Music));
+    }
+
+    #[test]
+    fn test_space_selector_hidden_when_collapsed_and_media_untouched() {
+        let renderer = Renderer::new().expect("renderer");
+        let c = content("Song", Some(sample_artwork(64, 64)));
+        renderer.set_media(Some(&c));
+        renderer.set_space(NottSpace::Music);
+        // Collapsed: no selector at all (notch body stays pure black)
+        let collapsed = NotchDimensions::from_state_and_dpi(NotchState::Collapsed, 96);
+        let (px, stride) = render_selector_frame(&renderer, &collapsed);
+        let all = RectF::new(0.0, 0.0, collapsed.width as f32, collapsed.height as f32);
+        assert!(!lit_in(&px, stride, all, 5), "nothing drawn when collapsed");
+        // Expanding again shows the still-active Music space
+        let expanded = NotchDimensions::from_state_and_dpi(NotchState::Expanded, 96);
+        let sel = resolve_space_selector_in(&expanded, NottSpace::Music).unwrap();
+        let (px, stride) = render_selector_frame(&renderer, &expanded);
+        let r = sel.music;
+        let (x, y) = (
+            (r.left + r.height() * 0.35) as usize,
+            ((r.top + r.bottom) / 2.0) as usize,
+        );
+        assert!(
+            px[y * stride + x] & 0xFF > 15,
+            "Music still selected after re-expanding"
+        );
+        // Switching spaces never touches the shared media content
+        assert!(
+            !renderer.set_media(Some(&c)),
+            "media unchanged by space switches"
+        );
+        renderer.set_space(NottSpace::Home);
+        assert!(!renderer.set_media(Some(&c)));
+    }
+
+    /// Renders an arbitrary frame: notch body, then `draw`.
+    fn render_custom_frame(
+        renderer: &Renderer,
+        dims: &NotchDimensions,
+        draw: impl FnOnce(&ID2D1RenderTarget),
+    ) -> (Vec<u32>, usize) {
+        renderer.ensure_buffer(dims.width, dims.height).unwrap();
+        let rt_ref = renderer.cached_rt.borrow();
+        let rt = rt_ref.as_ref().unwrap();
+        unsafe {
+            let bind = RECT {
+                left: 0,
+                top: 0,
+                right: dims.width,
+                bottom: dims.height,
+            };
+            rt.BindDC(renderer.cached_mem_dc.get(), &bind).unwrap();
+            rt.BeginDraw();
+            rt.Clear(Some(&COLOR_TRANSPARENT));
+            let fill = rt.CreateSolidColorBrush(&NOTCH_BG_COLOR, None).unwrap();
+            rt.FillGeometry(&renderer.create_notch_geometry(dims).unwrap(), &fill, None);
+            draw(rt);
+            rt.EndDraw(None, None).unwrap();
+        }
+        let stride = renderer.cached_capacity_w.get() as usize;
+        let bits = renderer.cached_bits.get() as *const u32;
+        let pixels = unsafe { std::slice::from_raw_parts(bits, stride * dims.height as usize) };
+        (pixels.to_vec(), stride)
+    }
+
+    fn music_frame(
+        renderer: &Renderer,
+        dims: &NotchDimensions,
+        c: &MediaContent,
+    ) -> (Vec<u32>, usize) {
+        renderer.set_media(Some(c));
+        renderer.feedback().finish_track_fade();
+        let clock = ClockDateState::from_pure_components(2026, 10, 6, 2, 0, 47, 0, 0, false);
+        render_custom_frame(renderer, dims, |rt| {
+            let ResolvedLayout::Expanded { components, .. } = resolve_layout(dims) else {
+                panic!("expanded");
+            };
+            let media = renderer.media.borrow();
+            let media = media.as_ref().unwrap();
+            let m = resolve_media_layout_in(dims, media.content.shape(), NottSpace::Music).unwrap();
+            renderer
+                .render_media_content(rt, &components, &m, dims, &clock, media)
+                .unwrap();
+        })
+    }
+
+    #[test]
+    fn test_music_space_renders_focused_player_without_clock() {
+        let renderer = Renderer::new().expect("renderer");
+        for dpi in [96u32, 144] {
+            let dims = crate::layout::space_dimensions(NotchState::Expanded, dpi, NottSpace::Music);
+            let c = playing_content(crate::media::PlaybackState::Playing);
+            renderer.set_media(Some(&c));
+            renderer.visualizer().step(1000.0);
+            let m = resolve_media_layout_in(&dims, c.shape(), NottSpace::Music).unwrap();
+            let (px, stride) = music_frame(&renderer, &dims, &c);
+            assert!(lit_in(&px, stride, m.title_bounds, 80), "title at {dpi}");
+            assert!(
+                lit_in(&px, stride, m.artwork_bounds.unwrap(), 80),
+                "artwork at {dpi}"
+            );
+            assert!(
+                accent_in(&px, stride, m.timeline_bounds),
+                "accent scrubber at {dpi}"
+            );
+            assert!(
+                accent_in(&px, stride, m.visualizer_bounds),
+                "visualizer at {dpi}"
+            );
+            // No time/date column in Music
+            assert_eq!(m.time_bounds.width(), 0.0);
+            assert_eq!(m.date_bounds.width(), 0.0);
+            // Long title stays ellipsis-trimmed inside its own bounds
+            let long = MediaContent {
+                title: LONG_TITLE.into(),
+                ..c.clone()
+            };
+            let (px, stride) = music_frame(&renderer, &dims, &long);
+            let past_title = RectF::new(
+                m.title_bounds.right + 1.0,
+                m.title_bounds.top,
+                m.visualizer_bounds.left - 1.0,
+                m.title_bounds.bottom,
+            );
+            assert!(
+                !lit_in(&px, stride, past_title, 40),
+                "long title trimmed at {dpi}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_music_empty_state_shows_no_stale_media() {
+        let renderer = Renderer::new().expect("renderer");
+        let dims = crate::layout::space_dimensions(NotchState::Expanded, 96, NottSpace::Music);
+        // A previous track was showing, then the session went away
+        renderer.set_media(Some(&playing_content(crate::media::PlaybackState::Playing)));
+        renderer.set_media(None);
+        assert!(renderer.media.borrow().is_none(), "media cleared");
+        assert!(
+            renderer.art_bitmap.borrow().is_none(),
+            "artwork bitmap released"
+        );
+        renderer.visualizer().step(1000.0);
+        assert_eq!(renderer.visualizer().level(), 0.0, "visualizer hidden");
+        let ResolvedLayout::Expanded { components, .. } = resolve_layout(&dims) else {
+            unreachable!()
+        };
+        let (px, stride) = render_custom_frame(&renderer, &dims, |rt| {
+            renderer.draw_music_empty(rt, &components, &dims).unwrap();
+        });
+        let c = components.content_bounds;
+        assert!(lit_in(&px, stride, c, 60), "quiet empty label");
+        assert!(!accent_in(&px, stride, c), "no stale accent");
+        // Only a centered label: the cover slot (left) stays black
+        let cover_slot = RectF::new(c.left, c.top, c.left + 60.0, c.bottom);
+        assert!(!lit_in(&px, stride, cover_slot, 20), "no stale artwork");
+    }
+
+    fn clipboard_frame(renderer: &Renderer, dims: &NotchDimensions) -> (Vec<u32>, usize) {
+        render_custom_frame(renderer, dims, |rt| {
+            renderer.draw_clipboard(rt, dims).unwrap()
+        })
+    }
+
+    fn row_kinds(renderer: &Renderer) -> Vec<&'static str> {
+        renderer
+            .clipboard
+            .borrow()
+            .rows
+            .iter()
+            .map(|r| match r {
+                ClipRow::Text(_) => "text",
+                ClipRow::Image(..) => "image",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_clipboard_empty_state_renders() {
+        let renderer = Renderer::new().expect("renderer");
+        renderer.set_clipboard(&ClipboardHistory::default());
+        for dpi in ALL_DPIS {
+            let dims =
+                crate::layout::space_dimensions(NotchState::Expanded, dpi, NottSpace::Clipboard);
+            let l = resolve_clipboard_layout(&dims).unwrap();
+            let (px, stride) = clipboard_frame(&renderer, &dims);
+            assert!(lit_in(&px, stride, l.list, 60), "empty label at {dpi}");
+            assert!(
+                !lit_in(&px, stride, l.clear, 12),
+                "no Clear when empty at {dpi}"
+            );
+            // No row tiles: the first row's left edge strip stays black
+            let r = l.rows[0];
+            let edge = RectF::new(r.left, r.top, r.left + 6.0, r.bottom);
+            assert!(!lit_in(&px, stride, edge, 8), "no rows at {dpi}");
+        }
+        assert!(renderer.clipboard.borrow().rows.is_empty());
+    }
+
+    #[test]
+    fn test_clipboard_rows_newest_first_with_thumbnail() {
+        let renderer = Renderer::new().expect("renderer");
+        let mut history = ClipboardHistory::default();
+        history.add(ClipboardItem::Text("first".into()));
+        history.add(ClipboardItem::Image(sample_artwork(300, 100)));
+        history.add(ClipboardItem::Text("third\nline\n".into()));
+        renderer.set_clipboard(&history);
+        assert_eq!(row_kinds(&renderer), ["text", "image", "text"]);
+        let first_row = || match &renderer.clipboard.borrow().rows[0] {
+            ClipRow::Text(t) => String::from_utf16(t).unwrap(),
+            ClipRow::Image(..) => unreachable!(),
+        };
+        assert_eq!(first_row(), "third line", "newline shown as a space");
+        assert_eq!(
+            history.get(0),
+            Some(&ClipboardItem::Text("third\nline\n".into())),
+            "entry keeps its text"
+        );
+
+        let dims = crate::layout::space_dimensions(NotchState::Expanded, 144, NottSpace::Clipboard);
+        let l = resolve_clipboard_layout(&dims).unwrap();
+        let (px, stride) = clipboard_frame(&renderer, &dims);
+        assert!(lit_in(&px, stride, l.clear, 60), "Clear shown");
+        // Image row: orange thumbnail at the row's left
+        let r = l.rows[1];
+        let (x, y) = (
+            (r.left + r.height() / 2.0) as usize,
+            ((r.top + r.bottom) / 2.0) as usize,
+        );
+        let p = px[y * stride + x];
+        assert!(
+            (p >> 16) & 0xFF > 200 && p & 0xFF < 100,
+            "thumbnail drawn: {p:08x}"
+        );
+        assert!(lit_in(&px, stride, l.rows[0], 60) && lit_in(&px, stride, l.rows[2], 60));
+        assert!(!lit_in(&px, stride, l.rows[3], 12), "only three rows");
+        // Buttons are hidden until a row is hovered
+        for r in &l.rows[..3] {
+            let (_, copy, trash) = ClipboardLayout::row_parts(*r);
+            let icons = RectF::new(
+                copy.left + 4.0,
+                copy.top + 5.0,
+                trash.right - 4.0,
+                copy.bottom - 5.0,
+            );
+            assert!(!lit_in(&px, stride, icons, 60), "no buttons without hover");
+        }
+        // Hovering row 0 shows only row 0's buttons
+        renderer.feedback().set_clip_row(Some(0));
+        while renderer.feedback().step(16.0) {}
+        let (px, stride) = clipboard_frame(&renderer, &dims);
+        for (i, r) in l.rows[..3].iter().enumerate() {
+            let (_, copy, trash) = ClipboardLayout::row_parts(*r);
+            let lit = lit_in(&px, stride, copy, 120) && lit_in(&px, stride, trash, 120);
+            assert_eq!(lit, i == 0, "row {i} buttons");
+        }
+        renderer.feedback().reset();
+        let (px, stride) = clipboard_frame(&renderer, &dims);
+        for r in &l.rows[..3] {
+            let entry = *r;
+            // Outline only, spanning the whole row: both side edges are lit
+            let right_edge = RectF::new(
+                entry.right - 1.5,
+                entry.top + 8.0,
+                entry.right,
+                entry.bottom - 8.0,
+            );
+            assert!(
+                lit_in(&px, stride, right_edge, 25),
+                "outline reaches the row end"
+            );
+            // Outline only: the box's edge is lit, its empty middle stays black,
+            // and it closes off before the buttons
+            let edge = RectF::new(
+                entry.left,
+                entry.top + 6.0,
+                entry.left + 1.5,
+                entry.bottom - 6.0,
+            );
+            assert!(lit_in(&px, stride, edge, 25), "outline edge");
+            let inside = RectF::new(
+                entry.right - 40.0,
+                entry.top + 6.0,
+                entry.right - 14.0,
+                entry.bottom - 6.0,
+            );
+            assert!(!lit_in(&px, stride, inside, 12), "no filled tile");
+        }
+        // The thumbnail bitmap is cached and reused, not rebuilt per frame
+        let first = renderer.thumbs.borrow()[0].2.clone();
+        clipboard_frame(&renderer, &dims);
+        assert_eq!(renderer.thumbs.borrow().len(), 1);
+        assert_eq!(renderer.thumbs.borrow()[0].2, first);
+
+        // Clear: rows, label and thumbnail memory all go; the empty state is valid
+        history.clear();
+        renderer.set_clipboard(&history);
+        assert!(renderer.clipboard.borrow().rows.is_empty());
+        assert!(renderer.thumbs.borrow().is_empty(), "thumbnails released");
+        let (px, stride) = clipboard_frame(&renderer, &dims);
+        assert!(lit_in(&px, stride, l.list, 60), "empty state after clear");
+        assert!(!lit_in(&px, stride, l.clear, 12));
+    }
+
+    #[test]
+    fn test_clipboard_updates_refresh_view_without_touching_media() {
+        let renderer = Renderer::new().expect("renderer");
+        let media = playing_content(crate::media::PlaybackState::Playing);
+        renderer.set_media(Some(&media));
+        let mut history = ClipboardHistory::default();
+        history.add(ClipboardItem::Text("one".into()));
+        renderer.set_clipboard(&history);
+        assert_eq!(row_kinds(&renderer).len(), 1);
+        history.add(ClipboardItem::Text("two".into()));
+        renderer.set_clipboard(&history);
+        assert_eq!(row_kinds(&renderer).len(), 2);
+        // Restore: promoted entry is first, no duplicate row
+        history.promote(1);
+        renderer.set_clipboard(&history);
+        let first_row = || match &renderer.clipboard.borrow().rows[0] {
+            ClipRow::Text(t) => String::from_utf16(t).unwrap(),
+            ClipRow::Image(..) => unreachable!(),
+        };
+        assert_eq!(first_row(), "one");
+        assert_eq!(row_kinds(&renderer).len(), 2);
+        // Home -> Clipboard -> Music -> Home keeps both media and clipboard state
+        for s in [NottSpace::Clipboard, NottSpace::Music, NottSpace::Home] {
+            renderer.set_space(s);
+        }
+        assert_eq!(renderer.media.borrow().as_ref().unwrap().content, media);
+        assert_eq!(row_kinds(&renderer).len(), 2);
+        // At most the visible rows are kept, however long the history
+        for i in 0..20 {
+            history.add(ClipboardItem::Text(format!("t{i}")));
+        }
+        renderer.set_clipboard(&history);
+        assert_eq!(row_kinds(&renderer).len(), CLIPBOARD_VISIBLE_ROWS);
+    }
+
+    /// The expanded content of one transition frame.
+    fn transition_frame(
+        renderer: &Renderer,
+        dims: &NotchDimensions,
+        t: Transition,
+    ) -> (Vec<u32>, usize) {
+        renderer.set_transition(Some(t));
+        let clock = ClockDateState::from_pure_components(2026, 10, 6, 2, 0, 47, 0, 0, false);
+        let frame = render_custom_frame(renderer, dims, |rt| {
+            renderer.draw_expanded(rt, dims, &clock).unwrap()
+        });
+        renderer.set_transition(None);
+        frame
+    }
+
+    #[test]
+    fn test_transition_frames_blend_inside_the_notch() {
+        let renderer = Renderer::new().expect("renderer");
+        renderer.set_media(Some(&playing_content(crate::media::PlaybackState::Playing)));
+        renderer.feedback().finish_track_fade();
+        let mut h = ClipboardHistory::default();
+        h.add(ClipboardItem::Text("row".into()));
+        renderer.set_clipboard(&h);
+        let home = NotchDimensions::from_state_and_dpi(NotchState::Expanded, 120);
+        // A shell mid-way between sizes: every scene is laid out at its own
+        // settled size, so parts overhang and must be clipped to the notch
+        let mid = home.with_width_dip(470.0).with_height_dip(170.0);
+        let (bare, _) = render_custom_frame(&renderer, &mid, |_| {});
+        let s = |x| Scene::Space(x);
+        let pairs = [
+            (s(NottSpace::Home), s(NottSpace::Music)),
+            (s(NottSpace::Music), s(NottSpace::Clipboard)),
+            (s(NottSpace::Clipboard), s(NottSpace::Home)),
+            (s(NottSpace::Home), Scene::Drop),
+        ];
+        for (from, to) in pairs {
+            for mix in [0.0, 0.3, 0.5, 0.7, 1.0] {
+                let t = Transition {
+                    from,
+                    to,
+                    mix,
+                    alpha: 1.0,
+                };
+                let (px, _) = transition_frame(&renderer, &mid, t);
+                for (i, (&p, &b)) in px.iter().zip(&bare).enumerate() {
+                    if b >> 24 == 0 {
+                        assert_eq!(p, 0, "outside the notch at {i} ({from:?}->{to:?} {mix})");
+                    }
+                }
+                assert!(px != bare, "content drawn ({from:?}->{to:?} {mix})");
+            }
+        }
+        // Content opacity: 0 leaves only the black shell; half is dimmer
+        let t = |alpha| Transition {
+            from: s(NottSpace::Music),
+            to: s(NottSpace::Music),
+            mix: 1.0,
+            alpha,
+        };
+        assert!(transition_frame(&renderer, &mid, t(0.0)).0 == bare);
+        let peak = |px: &[u32]| px.iter().map(|p| p & 0xFF).max().unwrap();
+        let (full, _) = transition_frame(&renderer, &mid, t(1.0));
+        let (half, _) = transition_frame(&renderer, &mid, t(0.5));
+        assert!(peak(&half) < peak(&full));
+    }
+
+    #[test]
+    fn test_settled_frame_unchanged_by_transition_path() {
+        // A settled transition (from == to, mix 1, alpha 1) draws exactly what
+        // the settled renderer draws
+        let renderer = Renderer::new().expect("renderer");
+        renderer.set_media(Some(&playing_content(crate::media::PlaybackState::Paused)));
+        renderer.feedback().finish_track_fade();
+        for space in NottSpace::ALL {
+            renderer.set_space(space);
+            let dims = crate::layout::space_dimensions(NotchState::Expanded, 144, space);
+            let clock = ClockDateState::from_pure_components(2026, 10, 6, 2, 0, 47, 0, 0, false);
+            let (settled, _) = render_custom_frame(&renderer, &dims, |rt| {
+                renderer.draw_expanded(rt, &dims, &clock).unwrap()
+            });
+            let t = Transition {
+                from: Scene::Space(space),
+                to: Scene::Space(space),
+                mix: 1.0,
+                alpha: 1.0,
+            };
+            assert!(
+                transition_frame(&renderer, &dims, t).0 == settled,
+                "{space:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_drop_page_revealed_in_place_and_clipped_to_the_notch() {
+        let renderer = Renderer::new().expect("renderer");
+        let full = drop_page_dimensions(144);
+        let (big, stride_big) = render_custom_frame(&renderer, &full, |rt| {
+            renderer.draw_drop_page(rt, &full).unwrap()
+        });
+        // Mid-opening frames (narrower/shorter silhouettes, e.g. from Music)
+        for (w, h) in [(384.0, 158.0), (300.0, 70.0), (420.0, 110.0)] {
+            let dims = full.with_width_dip(w).with_height_dip(h);
+            let (bare, stride) = render_custom_frame(&renderer, &dims, |_| {});
+            let (px, _) = render_custom_frame(&renderer, &dims, |rt| {
+                renderer.draw_drop_page(rt, &dims).unwrap()
+            });
+            let dx = (full.width - dims.width) as usize / 2;
+            for y in 0..dims.height as usize {
+                for x in 0..dims.width as usize {
+                    let (p, b) = (px[y * stride + x], bare[y * stride + x]);
+                    if b >> 24 == 0 {
+                        assert_eq!(p, 0, "nothing outside the silhouette at {x},{y} ({w}x{h})");
+                    } else if y < full.height as usize - 30 && p & 0xFF > 200 {
+                        // Lit pixels are exactly where the settled page has them
+                        let q = big[y * stride_big + x + dx];
+                        assert!(
+                            q & 0xFF > 120,
+                            "page revealed in place at {x},{y} ({w}x{h})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_drop_page_icon_and_dashed_outline_replace_content() {
+        let renderer = Renderer::new().expect("renderer");
+        assert!(renderer.set_drop_page(true) && !renderer.set_drop_page(true));
+        for dpi in ALL_DPIS {
+            let dims = drop_page_dimensions(dpi);
+            let (px, stride) = render_custom_frame(&renderer, &dims, |rt| {
+                renderer.draw_drop_page(rt, &dims).unwrap()
+            });
+            let (w, body) = (
+                dims.width as usize,
+                dims.height - dims.shadow_margin_bottom as i32,
+            );
+            // Inbox glyph at the centre of the outline
+            let (cx, cy) = (w / 2, (body as f32 / 2.0) as usize);
+            let s = dims.scale;
+            let icon = RectF::new(
+                cx as f32 - 12.0 * s,
+                cy as f32 - 12.0 * s,
+                cx as f32 + 12.0 * s,
+                cy as f32 + 12.0 * s,
+            );
+            assert!(lit_in(&px, stride, icon, 150), "inbox glyph at {dpi}");
+            // Bottom edge of the outline: dashes, i.e. lit and dark runs alternate
+            let inset = (8.0 * s).round() + (1.5 * s).round().max(1.0) / 2.0;
+            let y = (body as f32 - inset).round() as usize;
+            let row: Vec<bool> = (w / 4..3 * w / 4)
+                .map(|x| (px[y * stride + x] & 0xFF) > 40 || (px[(y - 1) * stride + x] & 0xFF) > 40)
+                .collect();
+            let runs = row.windows(2).filter(|p| p[0] != p[1]).count();
+            assert!(
+                row.iter().any(|b| *b) && runs > 10,
+                "dashed outline at {dpi}: {runs}"
+            );
+        }
+        assert!(renderer.set_drop_page(false));
+    }
+
+    #[test]
+    fn test_clipboard_thumbnail_center_crop_and_rounded() {
+        // 300x100: green | orange | blue thirds; the centre square is orange
+        let (w, h) = (300u32, 100u32);
+        let px: Vec<u8> = (0..w * h)
+            .flat_map(|i| match (i % w) / 100 {
+                0 => [0x00, 0xFF, 0x00, 0xFF],
+                1 => [0x20, 0x80, 0xF0, 0xFF],
+                _ => [0xFF, 0x00, 0x00, 0xFF],
+            })
+            .collect();
+        let t = thumbnail(&Artwork::new(w, h, px).unwrap(), 20, 5.0);
+        assert_eq!(
+            (t.width, t.height),
+            (20, 20),
+            "square, aspect kept by cropping"
+        );
+        let at = |x: usize, y: usize| &t.pixels[(y * 20 + x) * 4..(y * 20 + x) * 4 + 4];
+        assert_eq!(
+            at(10, 10),
+            [0x20, 0x80, 0xF0, 0xFF],
+            "centre is the middle third"
+        );
+        assert_eq!(
+            at(1, 10),
+            [0x20, 0x80, 0xF0, 0xFF],
+            "edges too: no side bands"
+        );
+        assert_eq!(at(0, 0)[3], 0, "rounded corner is transparent");
+        // Premultiplied: no channel exceeds alpha anywhere
+        assert!(
+            t.pixels
+                .chunks(4)
+                .all(|p| p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3])
+        );
+    }
+
+    #[test]
+    fn test_shadow_follows_the_music_width() {
+        let renderer = Renderer::new().expect("renderer");
+        let dims = crate::layout::space_dimensions(NotchState::Expanded, 96, NottSpace::Music);
+        let (px, stride) = render_custom_frame(&renderer, &dims, |_| {});
+        let (w, h) = (dims.width as usize, dims.height as usize);
+        let mut bytes: Vec<u8> = (0..h)
+            .flat_map(|y| {
+                px[y * stride..y * stride + w]
+                    .iter()
+                    .flat_map(|p| p.to_le_bytes())
+            })
+            .collect();
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        apply_ambient_shadow(
+            bytes.as_mut_ptr(),
+            w,
+            h,
+            w,
+            dims.scale,
+            dims.shadow_opacity,
+            &mut a,
+            &mut b,
+        );
+        let alpha = |x: usize, y: usize| bytes[(y * w + x) * 4 + 3];
+        let wall = (dims.shadow_margin_x + dims.curvature.top_transition_radius) as usize;
+        let mid = (dims.notch_height() * 0.7) as usize;
+        assert!(
+            alpha(wall - 3, mid) > 20,
+            "shadow along the Music notch's left wall"
+        );
+        assert!(alpha(w - wall + 2, mid) > 20, "and its right wall");
+        assert!(
+            alpha(w / 2, dims.notch_height() as usize + 2) > 40,
+            "and beneath it"
+        );
+        assert_eq!(alpha(0, mid), 0, "fades out inside the narrower window");
+    }
+
+    #[test]
+    fn test_home_has_no_scrubber_or_visualizer_but_keeps_its_overview() {
+        use crate::media::PlaybackState as P;
+        let renderer = Renderer::new().expect("renderer");
+        for dpi in [96u32, 144] {
+            let dims = NotchDimensions::from_state_and_dpi(NotchState::Expanded, dpi);
+            let c = playing_content(P::Playing);
+            renderer.set_media(Some(&c));
+            renderer.visualizer().step(1000.0);
+            let m = resolve_media_layout(&dims, c.shape()).unwrap();
+            let (px, stride) = render_media_frame(&renderer, &dims, &c);
+            // Where Music's scrubber (labels + track) would be: nothing at all
+            let next = m.control_visual_bounds(MediaControl::Next);
+            let row = RectF::new(
+                next.right + 2.0,
+                next.top,
+                m.title_bounds.right,
+                next.bottom,
+            );
+            assert!(!lit_in(&px, stride, row, 20), "no scrubber/labels at {dpi}");
+            // No visualizer either: the accent appears nowhere in Home
+            let ResolvedLayout::Expanded { components, .. } = resolve_layout(&dims) else {
+                unreachable!()
+            };
+            let text = RectF::new(
+                m.title_bounds.left,
+                components.content_bounds.top,
+                m.title_bounds.right,
+                components.content_bounds.bottom,
+            );
+            assert!(!accent_in(&px, stride, text), "no Home visualizer at {dpi}");
+            // Overview content remains
+            for (what, r) in [
+                ("time", m.time_bounds),
+                ("date", m.date_bounds),
+                ("title", m.title_bounds),
+                ("artist", m.artist_bounds),
+                ("source", m.source_bounds),
+                ("artwork", m.artwork_bounds.unwrap()),
+            ] {
+                assert!(lit_in(&px, stride, r, 60), "{what} at {dpi}");
+            }
+            for k in MediaControl::ALL {
+                assert!(
+                    lit_in(&px, stride, m.control_visual_bounds(k), 60),
+                    "{k:?} at {dpi}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_music_cover_has_no_badge() {
+        let renderer = Renderer::new().expect("renderer");
+        for dpi in [96u32, 144] {
+            let dims = crate::layout::space_dimensions(NotchState::Expanded, dpi, NottSpace::Music);
+            let green: Vec<u8> = (0..16 * 16)
+                .flat_map(|_| [0x20, 0xD0, 0x20, 0xFF])
+                .collect();
+            let mut c = content("Song", Some(sample_artwork(64, 64)));
+            c.source.icon = Some(Artwork::new(16, 16, green).unwrap());
+            assert!(c.shows_badge(), "Home would show the badge");
+            renderer.set_space(NottSpace::Music);
+            let (px, stride) = music_frame(&renderer, &dims, &c);
+            renderer.set_space(NottSpace::Home);
+            let green_at = |p: u32| ((p >> 8) & 0xFF) > 0xA0 && (p & 0xFF) < 0x60;
+            for y in 0..dims.height as usize {
+                for x in 0..dims.width as usize {
+                    assert!(
+                        !green_at(px[y * stride + x]),
+                        "badge pixel at ({x},{y}) {dpi}"
+                    );
+                }
+            }
+            let m = resolve_media_layout_in(&dims, c.shape(), NottSpace::Music).unwrap();
+            assert!(
+                lit_in(&px, stride, m.artwork_bounds.unwrap(), 80),
+                "cover drawn at {dpi}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_home_divider_drawn_and_long_title_stops_before_it() {
+        let renderer = Renderer::new().expect("renderer");
+        for dpi in [96u32, 144] {
+            let dims = NotchDimensions::from_state_and_dpi(NotchState::Expanded, dpi);
+            let c = MediaContent {
+                title: LONG_TITLE.into(),
+                ..content("Song", Some(sample_artwork(64, 64)))
+            };
+            let m = resolve_media_layout(&dims, c.shape()).unwrap();
+            let (px, stride) = render_media_frame(&renderer, &dims, &c);
+            let d = m.divider_bounds;
+            let (x, y) = (d.left as usize, ((d.top + d.bottom) / 2.0) as usize);
+            let p = px[y * stride + x];
+            let (b, g, r) = (p & 0xFF, (p >> 8) & 0xFF, (p >> 16) & 0xFF);
+            assert!(
+                b > 15 && b < 80 && b == g && g == r,
+                "subtle grey divider at {dpi}: {b}"
+            );
+            // The long title ends (ellipsis) before the divider
+            let past = RectF::new(
+                m.title_bounds.right + 1.0,
+                m.title_bounds.top,
+                d.left - 1.0,
+                m.title_bounds.bottom,
+            );
+            assert!(
+                !lit_in(&px, stride, past, 40),
+                "title clear of the divider at {dpi}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_space_icons_solid_white_and_distinct() {
+        let renderer = Renderer::new().expect("renderer");
+        for dpi in [96u32, 144] {
+            let dims = NotchDimensions::from_state_and_dpi(NotchState::Expanded, dpi);
+            let sel = resolve_space_selector_in(&dims, NottSpace::Home).unwrap();
+            renderer.set_space(NottSpace::Home);
+            let (px, stride) = render_selector_frame(&renderer, &dims);
+            let brightest = |r: RectF| {
+                (r.top as usize..r.bottom as usize)
+                    .flat_map(|y| (r.left as usize..r.right as usize).map(move |x| (x, y)))
+                    .map(|(x, y)| px[y * stride + x] & 0xFF)
+                    .max()
+                    .unwrap()
+            };
+            let (home, music) = (brightest(sel.home), brightest(sel.music));
+            assert!(
+                home > 240 && music > 240,
+                "both icons white at {dpi}: {home}/{music}"
+            );
+            // Solid glyph: the house is filled, not just an outline
+            let r = sel.home;
+            let (x, y) = (
+                ((r.left + r.right) / 2.0) as usize,
+                ((r.top + r.bottom) / 2.0 + 2.0 * dims.scale) as usize,
+            );
+            assert!(px[y * stride + x] & 0xFF > 240, "house is filled at {dpi}");
+            // Two different glyphs: compare their lit pixel masks
+            let mask = |r: RectF| -> Vec<bool> {
+                (r.top as usize..r.bottom as usize)
+                    .flat_map(|y| (r.left as usize..r.right as usize).map(move |x| (x, y)))
+                    .map(|(x, y)| (px[y * stride + x] & 0xFF) > 60)
+                    .collect()
+            };
+            assert_ne!(mask(sel.home), mask(sel.music), "distinct icons at {dpi}");
+        }
     }
 }
