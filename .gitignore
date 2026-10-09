@@ -2,3 +2,5 @@
 .claude/
 graphify-out/
 CLAUDE.md
+.agents/skills/
+skills-lock.json
