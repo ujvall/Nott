@@ -7,6 +7,7 @@ mod dragdrop;
 mod layout;
 mod media;
 mod renderer;
+mod settings_window;
 mod space;
 mod window;
 

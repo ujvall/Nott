@@ -24,7 +24,63 @@ pub enum Scene {
     Drop,
 }
 
+/// The one panel size: the drop page and Settings always take the Clipboard
+/// space's settled size, whichever space is active (so they cannot drift).
+pub const PANEL_SPACE: NottSpace = NottSpace::Clipboard;
+
+/// In-memory user settings (every launch starts from the defaults).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NottSettings {
+    /// Topmost band (above normal windows). On by default: Nott has always
+    /// been a topmost window.
+    pub always_on_top: bool,
+    /// Snap instead of animating (the same snap path as the system's
+    /// reduced-motion preference). Off by default.
+    pub reduced_motion: bool,
+    /// Escape closes the full Settings window. On by default (the window's
+    /// original behavior); its title-bar X always works.
+    pub close_settings_on_escape: bool,
+    /// The Clipboard space's Clear asks before forgetting the history. On by
+    /// default.
+    pub confirm_clear_clipboard: bool,
+    /// Accent color (Settings > Appearance). White by default.
+    pub accent: crate::config::AccentChoice,
+    /// Entries the clipboard history keeps (Settings > Clipboard). 20 by
+    /// default.
+    pub clipboard_capacity: crate::config::ClipboardCapacity,
+    /// The source-app badge on the Home artwork (Settings > Media). On by
+    /// default.
+    pub show_source_app: bool,
+    /// The Music space's playback visualizer (Settings > Media). On by
+    /// default; the collapsed notch keeps its own.
+    pub show_visualizer: bool,
+}
+
+impl Default for NottSettings {
+    fn default() -> Self {
+        Self {
+            always_on_top: true,
+            reduced_motion: false,
+            close_settings_on_escape: true,
+            confirm_clear_clipboard: true,
+            accent: crate::config::AccentChoice::White,
+            clipboard_capacity: crate::config::ClipboardCapacity::Twenty,
+            show_source_app: true,
+            show_visualizer: true,
+        }
+    }
+}
+
 impl Scene {
+    /// The space whose settled size this scene takes: its own, or the panel
+    /// size for Settings and the drop page.
+    pub fn size_space(self) -> NottSpace {
+        match self {
+            Self::Space(space) => space,
+            Self::Settings | Self::Drop => PANEL_SPACE,
+        }
+    }
+
     /// What the expanded notch shows: an image drag's drop page first, then
     /// an open Settings page, otherwise the active space.
     pub fn current(drop_page: bool, settings_open: bool, space: NottSpace) -> Self {
@@ -95,6 +151,24 @@ mod tests {
             s.switch_to(target);
             assert_eq!(s, target, "repeated switching");
         }
+    }
+
+    #[test]
+    fn test_settings_and_drop_take_the_clipboard_size_from_any_space() {
+        for space in NottSpace::ALL {
+            assert_eq!(
+                Scene::current(false, true, space).size_space(),
+                NottSpace::Clipboard
+            );
+            assert_eq!(
+                Scene::current(true, false, space).size_space(),
+                NottSpace::Clipboard
+            );
+            assert_eq!(Scene::current(false, false, space).size_space(), space);
+        }
+        let s = NottSettings::default();
+        assert!(s.always_on_top && !s.reduced_motion);
+        assert!(s.close_settings_on_escape && s.confirm_clear_clipboard);
     }
 
     #[test]

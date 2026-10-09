@@ -187,6 +187,45 @@ pub const MEDIA_TRACK_FADE_MS: f32 = 180.0;
 /// Clipboard history (in memory only): newest-first entries, total owned image
 /// memory, and the longest text kept (UTF-16 code units, ~512 KB).
 pub const CLIPBOARD_MAX_ENTRIES: usize = 20;
+
+/// How many entries the clipboard history keeps (Settings > Clipboard). The
+/// largest is `CLIPBOARD_MAX_ENTRIES`, the default (the original behavior).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClipboardCapacity {
+    Five,
+    Ten,
+    #[default]
+    Twenty,
+}
+
+impl ClipboardCapacity {
+    pub const ALL: [Self; 3] = [Self::Five, Self::Ten, Self::Twenty];
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    pub fn from_index(i: usize) -> Option<Self> {
+        Self::ALL.get(i).copied()
+    }
+
+    pub fn entries(self) -> usize {
+        match self {
+            Self::Five => 5,
+            Self::Ten => 10,
+            Self::Twenty => CLIPBOARD_MAX_ENTRIES,
+        }
+    }
+
+    /// Display and accessible name ("5 items").
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Five => "5 items",
+            Self::Ten => "10 items",
+            Self::Twenty => "20 items",
+        }
+    }
+}
 pub const CLIPBOARD_MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 pub const CLIPBOARD_MAX_TEXT_UNITS: usize = 256 * 1024;
 /// One-shot settle delay before reading a clipboard change: the copying app
@@ -201,6 +240,10 @@ pub const MEDIA_FEEDBACK_FRAME_MS: u32 = 16;
 /// while the visualizer fades out, at a modest ~30 fps.
 pub const MEDIA_LIVE_TIMER_ID: usize = 1004;
 pub const MEDIA_LIVE_FRAME_MS: u32 = 33;
+/// The same timer's period while only the scrubber moves (the settled Music
+/// space with its visualizer hidden): ample for a seconds label and a bar
+/// that moves well under a pixel per tick.
+pub const MEDIA_SCRUBBER_FRAME_MS: u32 = 250;
 
 /// Playback visualizer: thin rounded bars (DIP at 96 DPI).
 pub const BASE_VISUALIZER_BAR_WIDTH: f32 = 2.0;
@@ -269,7 +312,7 @@ pub const BASE_CLIPBOARD_BOTTOM_PAD: f32 = 12.0;
 /// Copy / trash glyphs after each row's outline, and the header's clear X
 /// (each in a row- or band-height square).
 pub const BASE_CLIPBOARD_ACTION_ICON_SIZE: f32 = 13.0;
-pub const BASE_CLIPBOARD_CLEAR_ICON_SIZE: f32 = 11.0;
+pub const BASE_CLIPBOARD_CLEAR_ICON_SIZE: f32 = 9.0;
 /// Row outline stroke (DIP).
 pub const BASE_CLIPBOARD_ROW_OUTLINE: f32 = 1.0;
 /// Icon button growth at full hover / full press (fractions, additive).
@@ -285,6 +328,11 @@ pub const BASE_SETTINGS_TOGGLE_WIDTH: f32 = 34.0;
 pub const BASE_SETTINGS_TOGGLE_HEIGHT: f32 = 20.0;
 pub const BASE_SETTINGS_TOGGLE_KNOB_INSET: f32 = 2.0;
 pub const BASE_SETTINGS_TOGGLE_GAP: f32 = 12.0;
+/// Between the setting rows, and the "Open Full Settings" action row.
+pub const BASE_SETTINGS_ROW_GAP: f32 = 10.0;
+pub const BASE_SETTINGS_ACTION_HEIGHT: f32 = 22.0;
+/// Chevron at the action row's end (glyph box, DIP).
+pub const BASE_SETTINGS_CHEVRON_SIZE: f32 = 8.0;
 
 /// Longest text preview kept for a row (characters; DirectWrite ellipsizes).
 pub const CLIPBOARD_PREVIEW_CHARS: usize = 160;
@@ -387,6 +435,84 @@ pub const COLOR_ARTWORK_HAIRLINE: D2D1_COLOR_F = D2D1_COLOR_F {
     b: 1.0,
     a: 0.08,
 };
+
+/// sRGB bytes as a renderer color (the one conversion for every accent:
+/// the user's choice and the artwork-derived media accent).
+pub fn rgb_color([r, g, b]: [u8; 3]) -> D2D1_COLOR_F {
+    D2D1_COLOR_F {
+        r: f32::from(r) / 255.0,
+        g: f32::from(g) / 255.0,
+        b: f32::from(b) / 255.0,
+        a: 1.0,
+    }
+}
+
+/// The user's accent (Settings > Appearance): a few named colors that read
+/// on the black notch. Used only where Nott already shows an accent: an "on"
+/// switch, the Settings window's selected-page bar, and the playback
+/// visualizer / scrubber when the artwork gives no accent of its own.
+/// `White` (the default) is the original neutral accent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AccentChoice {
+    #[default]
+    White,
+    Blue,
+    Teal,
+    Green,
+    Amber,
+    Rose,
+    Violet,
+}
+
+impl AccentChoice {
+    pub const ALL: [Self; 7] = [
+        Self::White,
+        Self::Blue,
+        Self::Teal,
+        Self::Green,
+        Self::Amber,
+        Self::Rose,
+        Self::Violet,
+    ];
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    pub fn from_index(i: usize) -> Option<Self> {
+        Self::ALL.get(i).copied()
+    }
+
+    /// Display and accessible name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::White => "White",
+            Self::Blue => "Blue",
+            Self::Teal => "Teal",
+            Self::Green => "Green",
+            Self::Amber => "Amber",
+            Self::Rose => "Rose",
+            Self::Violet => "Violet",
+        }
+    }
+
+    /// sRGB value (all light enough for a black knob / black surface).
+    pub fn rgb(self) -> [u8; 3] {
+        match self {
+            Self::White => [245, 245, 247],
+            Self::Blue => [80, 160, 255],
+            Self::Teal => [64, 200, 190],
+            Self::Green => [72, 200, 110],
+            Self::Amber => [255, 180, 60],
+            Self::Rose => [255, 110, 140],
+            Self::Violet => [170, 135, 255],
+        }
+    }
+
+    pub fn color(self) -> D2D1_COLOR_F {
+        rgb_color(self.rgb())
+    }
+}
 
 /// Selected space pill: a quiet lift off the black surface
 pub const COLOR_SPACE_PILL_SELECTED: D2D1_COLOR_F = D2D1_COLOR_F {
@@ -3037,6 +3163,83 @@ mod tests {
                 settled(120, size),
                 "settles exactly on the settled dims"
             );
+        }
+    }
+
+    #[test]
+    fn test_accent_choices_ids_default_and_contrast() {
+        assert_eq!(AccentChoice::default(), AccentChoice::White);
+        assert_eq!(
+            AccentChoice::ALL.map(AccentChoice::name),
+            ["White", "Blue", "Teal", "Green", "Amber", "Rose", "Violet"]
+        );
+        for (i, a) in AccentChoice::ALL.into_iter().enumerate() {
+            assert_eq!(a.index(), i, "stable identifier");
+            assert_eq!(AccentChoice::from_index(i), Some(a));
+        }
+        assert_eq!(AccentChoice::from_index(AccentChoice::ALL.len()), None);
+        // Distinct colors, each readable on the black notch (WCAG non-text
+        // contrast >= 3:1 against black)
+        let luminance = |[r, g, b]: [u8; 3]| {
+            let lin = |c: u8| {
+                let c = f32::from(c) / 255.0;
+                if c <= 0.04045 {
+                    c / 12.92
+                } else {
+                    ((c + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+        };
+        for a in AccentChoice::ALL {
+            assert!((luminance(a.rgb()) + 0.05) / 0.05 >= 3.0, "{a:?}");
+            for b in AccentChoice::ALL {
+                assert!(a == b || a.rgb() != b.rgb());
+            }
+        }
+    }
+
+    #[test]
+    fn test_accent_color_conversion() {
+        let c = rgb_color([255, 0, 51]);
+        assert_eq!((c.r, c.g, c.b, c.a), (1.0, 0.0, 0.2, 1.0));
+        for a in AccentChoice::ALL {
+            let c = a.color();
+            let [r, g, b] = a.rgb();
+            assert_eq!(
+                [c.r, c.g, c.b].map(|v| (v * 255.0).round() as u8),
+                [r, g, b]
+            );
+            assert_eq!(c.a, 1.0);
+        }
+        // The default renders exactly as the original neutral accent
+        let (w, p) = (AccentChoice::White.color(), COLOR_TEXT_PRIMARY);
+        for (x, y) in [(w.r, p.r), (w.g, p.g), (w.b, p.b)] {
+            assert_eq!((x * 255.0).round(), (y * 255.0).round());
+        }
+    }
+
+    #[test]
+    fn test_reduced_motion_snap_lands_where_the_unchanged_springs_settle() {
+        // Reduced motion snaps straight to the target geometry; with motion
+        // on, the (unchanged) springs animate over several frames and settle
+        // on exactly that geometry, for every space and both directions
+        for size in SPACES {
+            for (from, to) in [
+                (NotchState::Collapsed, NotchState::Expanded),
+                (NotchState::Expanded, NotchState::Collapsed),
+            ] {
+                let mut anim = AnimationState::start(
+                    from,
+                    size,
+                    to,
+                    size,
+                    Scene::Space(crate::space::NottSpace::Home),
+                );
+                let f = frames(&mut anim);
+                assert!(f.len() > 10, "normal motion still animates");
+                assert_eq!(*f.last().unwrap(), geometry_for(to, size));
+            }
         }
     }
 }

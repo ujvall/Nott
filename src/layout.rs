@@ -26,9 +26,9 @@ use crate::config::{
     SKIP_GLYPH_HALF_WIDTH,
 };
 use crate::config::{
-    BASE_SETTINGS_DESCRIPTION_HEIGHT, BASE_SETTINGS_LABEL_GAP, BASE_SETTINGS_LABEL_HEIGHT,
-    BASE_SETTINGS_TITLE_HEIGHT, BASE_SETTINGS_TOGGLE_GAP, BASE_SETTINGS_TOGGLE_HEIGHT,
-    BASE_SETTINGS_TOGGLE_WIDTH,
+    BASE_SETTINGS_ACTION_HEIGHT, BASE_SETTINGS_DESCRIPTION_HEIGHT, BASE_SETTINGS_LABEL_GAP,
+    BASE_SETTINGS_LABEL_HEIGHT, BASE_SETTINGS_ROW_GAP, BASE_SETTINGS_TITLE_HEIGHT,
+    BASE_SETTINGS_TOGGLE_GAP, BASE_SETTINGS_TOGGLE_HEIGHT, BASE_SETTINGS_TOGGLE_WIDTH,
 };
 use crate::media::MediaControl;
 use crate::media::VISUALIZER_BARS;
@@ -199,20 +199,18 @@ pub fn blended_selector(
     if dimensions.state != NotchState::Expanded {
         return None;
     }
-    // Settings and the drop page sit over the active space's layout
-    let space_of = |scene: Scene| match scene {
-        Scene::Space(s) => s,
-        Scene::Settings | Scene::Drop => space,
-    };
+    // Each scene lays the header out at its own settled size (Settings and
+    // the drop page: the panel size)
     let place = |scene: Scene| {
-        let space = space_of(scene);
-        let settled = space_dimensions(NotchState::Expanded, dimensions.dpi, space);
+        let size = scene.size_space();
+        let settled = space_dimensions(NotchState::Expanded, dimensions.dpi, size);
         let dx = ((dimensions.width - settled.width) as f32 / 2.0).round();
-        let sel = resolve_space_selector_in(&settled, space)?.map(|r| r.offset_x(dx));
+        let sel = resolve_space_selector_in(&settled, size)?.map(|r| r.offset_x(dx));
         // Highlight: the space's pill, or the Settings icon on Settings
         let highlight = match scene {
             Scene::Settings => sel.settings,
-            _ => sel.bounds(space),
+            Scene::Space(s) => sel.bounds(s),
+            Scene::Drop => sel.bounds(space),
         };
         Some((sel, highlight))
     };
@@ -226,14 +224,23 @@ pub fn blended_selector(
     Some((pills, ha.lerp(hb, mix)))
 }
 
-/// The Settings page: a section label, then the one setting row (title,
-/// description, switch at the right content edge).
+/// One quick setting: title, description, switch at the right content edge.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SettingsLayout {
-    pub label: RectF,
+pub struct SettingRow {
     pub title: RectF,
     pub description: RectF,
     pub toggle: RectF,
+}
+
+/// The Settings page: a section label, the quick settings, then the
+/// "Open Full Settings" action row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SettingsLayout {
+    pub label: RectF,
+    pub always_on_top: SettingRow,
+    pub reduced_motion: SettingRow,
+    /// Whole action row (text left, chevron at the right content edge).
+    pub full_settings: RectF,
 }
 
 /// Resolves the Settings page inside expanded dimensions (None when collapsed).
@@ -250,7 +257,6 @@ pub fn resolve_settings_layout(dimensions: &NotchDimensions) -> Option<SettingsL
     );
     let top = components.content_bounds.top.round();
     let label = RectF::new(left, top, right, top + px(BASE_SETTINGS_LABEL_HEIGHT));
-    let row_top = label.bottom + px(BASE_SETTINGS_LABEL_GAP);
     let (title_h, desc_h) = (
         px(BASE_SETTINGS_TITLE_HEIGHT),
         px(BASE_SETTINGS_DESCRIPTION_HEIGHT),
@@ -259,15 +265,30 @@ pub fn resolve_settings_layout(dimensions: &NotchDimensions) -> Option<SettingsL
         px(BASE_SETTINGS_TOGGLE_WIDTH),
         px(BASE_SETTINGS_TOGGLE_HEIGHT),
     );
-    let toggle_top = (row_top + (title_h + desc_h - th) / 2.0).round();
-    let toggle = RectF::new(right - tw, toggle_top, right, toggle_top + th);
-    let text_right = (toggle.left - px(BASE_SETTINGS_TOGGLE_GAP)).max(left);
-    let title = RectF::new(left, row_top, text_right, row_top + title_h);
+    let row = |row_top: f32| {
+        let toggle_top = (row_top + (title_h + desc_h - th) / 2.0).round();
+        let toggle = RectF::new(right - tw, toggle_top, right, toggle_top + th);
+        let text_right = (toggle.left - px(BASE_SETTINGS_TOGGLE_GAP)).max(left);
+        let title = RectF::new(left, row_top, text_right, row_top + title_h);
+        SettingRow {
+            title,
+            description: RectF::new(left, title.bottom, text_right, title.bottom + desc_h),
+            toggle,
+        }
+    };
+    let always_on_top = row(label.bottom + px(BASE_SETTINGS_LABEL_GAP));
+    let reduced_motion = row(always_on_top.description.bottom + px(BASE_SETTINGS_ROW_GAP));
+    let action_top = reduced_motion.description.bottom + px(BASE_SETTINGS_ROW_GAP);
     Some(SettingsLayout {
         label,
-        title,
-        description: RectF::new(left, title.bottom, text_right, title.bottom + desc_h),
-        toggle,
+        always_on_top,
+        reduced_motion,
+        full_settings: RectF::new(
+            left,
+            action_top,
+            right,
+            action_top + px(BASE_SETTINGS_ACTION_HEIGHT),
+        ),
     })
 }
 
@@ -278,6 +299,10 @@ pub enum PanelHit {
     Settings,
     /// The Settings page's Always-on-top switch.
     AlwaysOnTop,
+    /// The Settings page's Reduced-motion switch.
+    ReducedMotion,
+    /// The Settings page's "Open Full Settings" action row.
+    FullSettings,
     /// A history entry's outlined box (index into `ClipboardHistory`, newest
     /// first): restores it.
     Row(usize),
@@ -285,8 +310,13 @@ pub enum PanelHit {
     Copy(usize),
     /// The entry's trash button: forgets that entry.
     Remove(usize),
-    /// The header's X: clears the history.
+    /// The header's X: clears the history (asking first when the setting
+    /// says so).
     Clear,
+    /// The clear confirmation's Cancel: keeps the history.
+    CancelClear,
+    /// The clear confirmation's Clear: forgets the history.
+    ConfirmClear,
 }
 
 impl PanelHit {
@@ -305,6 +335,12 @@ pub struct ClipboardLayout {
     pub rows: [RectF; CLIPBOARD_VISIBLE_ROWS],
     /// The whole row area (the empty state centres in it).
     pub list: RectF,
+    /// The clear confirmation, centred in the row area in place of the rows:
+    /// its question, the note under it, then Cancel and Clear side by side.
+    pub confirm_message: RectF,
+    pub confirm_note: RectF,
+    pub cancel: RectF,
+    pub confirm_clear: RectF,
 }
 
 impl ClipboardLayout {
@@ -345,6 +381,17 @@ impl ClipboardLayout {
             entry.contains(px, py).then_some(PanelHit::Row(i))
         }
     }
+
+    /// While the clear confirmation shows, only its two buttons are live.
+    pub fn confirm_hit(&self, px: f32, py: f32) -> Option<PanelHit> {
+        if self.cancel.contains(px, py) {
+            Some(PanelHit::CancelClear)
+        } else {
+            self.confirm_clear
+                .contains(px, py)
+                .then_some(PanelHit::ConfirmClear)
+        }
+    }
 }
 
 /// Resolves the Clipboard space for expanded dimensions (None when collapsed).
@@ -376,7 +423,31 @@ pub fn resolve_clipboard_layout(dimensions: &NotchDimensions) -> Option<Clipboar
         RectF::new(left, t, right, t + h)
     });
     let list = RectF::new(left, top, right, rows[CLIPBOARD_VISIBLE_ROWS - 1].bottom);
-    Some(ClipboardLayout { clear, rows, list })
+    // Confirmation block (question 20, note 18, gap 12, buttons 28 DIP),
+    // vertically centred in the row area
+    let (line, note, gap, button) = (px(20.0), px(18.0), px(12.0), px(28.0));
+    let block_top = (list.top + (list.height() - (line + note + gap + button)) / 2.0).round();
+    let confirm_message = RectF::new(left, block_top, right, block_top + line);
+    let confirm_note = RectF::new(
+        left,
+        confirm_message.bottom,
+        right,
+        confirm_message.bottom + note,
+    );
+    let (bw, bgap) = (px(92.0), px(8.0));
+    let cx = ((left + right) / 2.0).round();
+    let btop = confirm_note.bottom + gap;
+    let cancel = RectF::new(cx - bgap / 2.0 - bw, btop, cx - bgap / 2.0, btop + button);
+    let confirm_clear = RectF::new(cx + bgap / 2.0, btop, cx + bgap / 2.0 + bw, btop + button);
+    Some(ClipboardLayout {
+        clear,
+        rows,
+        list,
+        confirm_message,
+        confirm_note,
+        cancel,
+        confirm_clear,
+    })
 }
 
 /// Whole-pixel (bar width, bar gap, full height) of the visualizer at `scale`.
@@ -1922,10 +1993,14 @@ mod tests {
                     (gear.top + gear.bottom) / 2.0,
                 );
                 assert_eq!(sel.space_at(cx, cy), None);
-                // On the Settings page the highlight sits on the icon
+                // On the Settings page (panel size) the highlight sits on the icon
+                let panel = space_dimensions(NotchState::Expanded, dpi, crate::space::PANEL_SPACE);
+                let panel_gear = resolve_space_selector_in(&panel, crate::space::PANEL_SPACE)
+                    .unwrap()
+                    .settings;
                 let (_, hi) =
-                    blended_selector(&dims, Scene::Settings, Scene::Settings, space, 1.0).unwrap();
-                assert_eq!(hi, gear);
+                    blended_selector(&panel, Scene::Settings, Scene::Settings, space, 1.0).unwrap();
+                assert_eq!(hi, panel_gear);
             }
             // Clipboard's clear X moves just left of the icon
             let dims = space_dimensions(NotchState::Expanded, dpi, NottSpace::Clipboard);
@@ -1938,19 +2013,43 @@ mod tests {
     }
 
     #[test]
-    fn test_settings_page_fits_every_space() {
+    fn test_settings_page_fits_the_panel_size() {
         for dpi in ALL_DPIS {
-            for space in NottSpace::ALL {
-                let dims = space_dimensions(NotchState::Expanded, dpi, space);
-                let l = resolve_settings_layout(&dims).unwrap();
-                let sel = resolve_space_selector_in(&dims, space).unwrap();
-                assert!(l.label.top >= sel.home.bottom, "below the header at {dpi}");
-                assert!(l.label.bottom <= l.title.top && l.title.bottom <= l.description.top);
-                assert!(l.title.right < l.toggle.left && l.description.right < l.toggle.left);
-                for r in [l.label, l.title, l.description, l.toggle] {
-                    for (x, y) in corners(&r) {
-                        assert!(dims.contains_point(x, y), "{space:?} {r:?} inside at {dpi}");
-                    }
+            // Settings is always laid out at the panel (Clipboard) size
+            let dims = space_dimensions(NotchState::Expanded, dpi, crate::space::PANEL_SPACE);
+            let l = resolve_settings_layout(&dims).unwrap();
+            let sel = resolve_space_selector_in(&dims, crate::space::PANEL_SPACE).unwrap();
+            assert!(l.label.top >= sel.home.bottom, "below the header at {dpi}");
+            let (a, m) = (l.always_on_top, l.reduced_motion);
+            assert!(l.label.bottom <= a.title.top && a.description.bottom < m.title.top);
+            assert!(
+                m.description.bottom < l.full_settings.top,
+                "rows in order at {dpi}"
+            );
+            for row in [a, m] {
+                assert!(row.title.bottom <= row.description.top);
+                assert!(
+                    row.title.right < row.toggle.left && row.description.right < row.toggle.left
+                );
+            }
+            assert!(!overlaps(&a.toggle, &m.toggle));
+            let body_bottom = dims.height as f32 - dims.shadow_margin_bottom;
+            assert!(
+                l.full_settings.bottom <= body_bottom - 4.0,
+                "room left at {dpi}"
+            );
+            for r in [
+                l.label,
+                a.title,
+                a.description,
+                a.toggle,
+                m.title,
+                m.description,
+                m.toggle,
+                l.full_settings,
+            ] {
+                for (x, y) in corners(&r) {
+                    assert!(dims.contains_point(x, y), "{r:?} inside at {dpi}");
                 }
             }
         }
@@ -2514,6 +2613,45 @@ mod tests {
             // Music has no divider
             let (_, m, _) = music(dpi, MediaShape::FULL);
             assert_eq!(m.divider_bounds.width(), 0.0);
+        }
+    }
+
+    #[test]
+    fn test_clear_confirmation_fits_and_hits_at_all_dpis() {
+        for dpi in ALL_DPIS {
+            let dims = space_dimensions(NotchState::Expanded, dpi, NottSpace::Clipboard);
+            let l = resolve_clipboard_layout(&dims).unwrap();
+            // Inside the row area, stacked, and the buttons side by side
+            // (Cancel first) without overlapping
+            for r in [l.confirm_message, l.confirm_note, l.cancel, l.confirm_clear] {
+                assert!(
+                    r.left >= l.list.left && r.right <= l.list.right,
+                    "{dpi}: {r:?} in {:?}",
+                    l.list
+                );
+                assert!(r.top >= l.list.top && r.bottom <= l.list.bottom, "{dpi}");
+            }
+            assert!(l.confirm_message.bottom <= l.confirm_note.top);
+            assert!(l.confirm_note.bottom < l.cancel.top);
+            assert!(l.cancel.right < l.confirm_clear.left);
+            assert_eq!(l.cancel.top, l.confirm_clear.top);
+            assert_eq!(l.cancel.width(), l.confirm_clear.width());
+            // Clear is nowhere near the header X (a double click on X never
+            // confirms)
+            assert!(l.clear.bottom < l.confirm_clear.top);
+            let mid = |r: RectF| ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
+            let (x, y) = mid(l.cancel);
+            assert_eq!(l.confirm_hit(x, y), Some(PanelHit::CancelClear));
+            let (x, y) = mid(l.confirm_clear);
+            assert_eq!(l.confirm_hit(x, y), Some(PanelHit::ConfirmClear));
+            for r in [l.clear, l.confirm_message, l.confirm_note] {
+                let (x, y) = mid(r);
+                assert_eq!(
+                    l.confirm_hit(x, y),
+                    None,
+                    "{dpi}: only the buttons are live"
+                );
+            }
         }
     }
 }

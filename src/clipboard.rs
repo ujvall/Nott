@@ -23,7 +23,7 @@ use windows::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
 
-use crate::config::{CLIPBOARD_MAX_ENTRIES, CLIPBOARD_MAX_IMAGE_BYTES, CLIPBOARD_MAX_TEXT_UNITS};
+use crate::config::{CLIPBOARD_MAX_IMAGE_BYTES, CLIPBOARD_MAX_TEXT_UNITS, ClipboardCapacity};
 use crate::media::Artwork;
 
 /// Standard clipboard formats (winuser.h).
@@ -101,11 +101,13 @@ pub enum AddOutcome {
     Rejected(Rejected),
 }
 
-/// Recent clipboard items, newest first, bounded by entry count and total image
-/// memory (oldest evicted first). Owned by `WindowState`.
+/// Recent clipboard items, newest first, bounded by entry count (the chosen
+/// capacity) and total image memory (oldest evicted first). Owned by
+/// `WindowState`.
 #[derive(Debug, Default)]
 pub struct ClipboardHistory {
     items: VecDeque<ClipboardItem>,
+    capacity: ClipboardCapacity,
 }
 
 impl ClipboardHistory {
@@ -140,12 +142,28 @@ impl ClipboardHistory {
             return AddOutcome::Duplicate;
         }
         self.items.push_front(item);
-        while self.items.len() > CLIPBOARD_MAX_ENTRIES
+        self.trim();
+        AddOutcome::Added
+    }
+
+    /// Drops the oldest entries until both limits hold. Image memory is
+    /// summed from the kept items, so it is always exact.
+    fn trim(&mut self) {
+        while self.items.len() > self.capacity.entries()
             || self.image_bytes() > CLIPBOARD_MAX_IMAGE_BYTES
         {
             self.items.pop_back();
         }
-        AddOutcome::Added
+    }
+
+    /// Uses a new capacity: a smaller one drops the oldest entries (the
+    /// newest keep their order); a larger one keeps everything. True if
+    /// entries were dropped. The system clipboard is untouched.
+    pub fn set_capacity(&mut self, capacity: ClipboardCapacity) -> bool {
+        let before = self.items.len();
+        self.capacity = capacity;
+        self.trim();
+        self.items.len() != before
     }
 
     /// Forgets one entry (its row's trash button).
@@ -444,6 +462,7 @@ pub(crate) fn artwork_to_dib(a: &Artwork) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{CLIPBOARD_MAX_ENTRIES, ClipboardCapacity};
 
     fn text(s: &str) -> ClipboardItem {
         ClipboardItem::Text(s.to_string())
@@ -761,5 +780,81 @@ mod tests {
         unsafe {
             let _ = DestroyWindow(owner);
         }
+    }
+
+    #[test]
+    fn test_capacity_trims_oldest_keeps_order_and_accounts_images() {
+        use windows::Win32::System::DataExchange::GetClipboardSequenceNumber;
+        let system_clipboard = unsafe { GetClipboardSequenceNumber() };
+        // 20 entries (the default): every third an image, newest first
+        let mut h = ClipboardHistory::default();
+        let item = |i: usize| {
+            if i.is_multiple_of(3) {
+                image(8, 8, i as u8)
+            } else {
+                text(&format!("item {i}"))
+            }
+        };
+        for i in 0..CLIPBOARD_MAX_ENTRIES {
+            assert_eq!(h.add(item(i)), AddOutcome::Added);
+        }
+        assert_eq!(h.len(), 20);
+        let all: Vec<ClipboardItem> = h.items().cloned().collect();
+        let bytes = |items: &[ClipboardItem]| items.iter().map(ClipboardItem::image_bytes).sum();
+        assert_eq!(h.image_bytes(), bytes(&all));
+        // 5: the 5 newest stay, in order; image memory is theirs only
+        assert!(h.set_capacity(ClipboardCapacity::Five));
+        let kept: Vec<ClipboardItem> = h.items().cloned().collect();
+        assert_eq!(kept, all[..5]);
+        assert_eq!(h.image_bytes(), bytes(&all[..5]));
+        assert!(h.image_bytes() < bytes(&all));
+        // New entries respect the smaller limit; duplicates still skipped
+        assert_eq!(h.add(text("new")), AddOutcome::Added);
+        assert_eq!(h.add(text("new")), AddOutcome::Duplicate);
+        assert_eq!(h.len(), 5);
+        assert_eq!(h.get(0), Some(&text("new")));
+        assert_eq!(h.get(4), Some(&all[3]), "oldest dropped");
+        // Larger: nothing removed, later entries fill up to the new limit
+        assert!(!h.set_capacity(ClipboardCapacity::Twenty));
+        assert_eq!(h.len(), 5);
+        for i in 100..120 {
+            h.add(text(&format!("more {i}")));
+        }
+        assert_eq!(h.len(), 20);
+        assert!(h.set_capacity(ClipboardCapacity::Ten));
+        assert_eq!(h.len(), 10);
+        assert_eq!(h.get(0), Some(&text("more 119")));
+        assert_eq!(h.image_bytes(), 0, "the images were the oldest");
+        // Same capacity again: no change
+        assert!(!h.set_capacity(ClipboardCapacity::Ten));
+        // The system clipboard was never written
+        assert_eq!(unsafe { GetClipboardSequenceNumber() }, system_clipboard);
+    }
+
+    #[test]
+    fn test_capacity_keeps_the_other_limits() {
+        // Options, default and the unchanged item limits
+        assert_eq!(ClipboardCapacity::default(), ClipboardCapacity::Twenty);
+        assert_eq!(
+            ClipboardCapacity::ALL.map(ClipboardCapacity::entries),
+            [5, 10, 20]
+        );
+        assert_eq!(
+            ClipboardCapacity::ALL.map(ClipboardCapacity::name),
+            ["5 items", "10 items", "20 items"]
+        );
+        for (i, c) in ClipboardCapacity::ALL.into_iter().enumerate() {
+            assert_eq!(c.index(), i);
+            assert_eq!(ClipboardCapacity::from_index(i), Some(c));
+        }
+        assert_eq!(ClipboardCapacity::from_index(3), None);
+        let mut h = ClipboardHistory::default();
+        h.set_capacity(ClipboardCapacity::Five);
+        assert_eq!(
+            h.add(text(&"x".repeat(CLIPBOARD_MAX_TEXT_UNITS + 1))),
+            AddOutcome::Rejected(Rejected::TextTooLong)
+        );
+        assert_eq!(CLIPBOARD_MAX_IMAGE_BYTES, 10 * 1024 * 1024);
+        assert_eq!(CLIPBOARD_MAX_TEXT_UNITS, 256 * 1024);
     }
 }
